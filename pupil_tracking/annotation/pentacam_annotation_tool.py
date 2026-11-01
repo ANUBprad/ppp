@@ -108,6 +108,7 @@ class PentacamAnnotationWorkspace:
         self._mode_var = tk.StringVar(value="pupil")
         self._orientation_var = tk.StringVar(value="0")
         self._annotator_var = tk.StringVar(value="")
+        self._failure_reason_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
         self._counter_var = tk.StringVar(value="0 / 0 images")
 
@@ -117,6 +118,7 @@ class PentacamAnnotationWorkspace:
             self._image_type_var,
             self._quality_var,
             self._annotator_var,
+            self._failure_reason_var,
         ):
             variable.trace_add("write", self._on_metadata_changed)
 
@@ -182,6 +184,8 @@ class PentacamAnnotationWorkspace:
 
         ttk.Label(controls, text="Annotator ID (optional)").pack(anchor="w", pady=(7, 0))
         ttk.Entry(controls, textvariable=self._annotator_var).pack(fill="x")
+        ttk.Label(controls, text="Annotation note / failure reason").pack(anchor="w", pady=(7, 0))
+        ttk.Entry(controls, textvariable=self._failure_reason_var).pack(fill="x")
 
         ttk.Separator(controls).pack(fill="x", pady=8)
         ttk.Label(controls, text="Annotation structure").pack(anchor="w")
@@ -351,6 +355,7 @@ class PentacamAnnotationWorkspace:
             self._image_type_var.set(document.get("image_type", PentacamImageType.UNKNOWN.value))
             self._quality_var.set(document.get("quality_grade", PentacamQuality.NO_DETECTION.value))
             self._annotator_var.set(document.get("annotator_id", ""))
+            self._failure_reason_var.set(document.get("failure_reason", ""))
             orientation = document.get("orientation_transform", {})
             degrees = int(orientation.get("display_rotation_degrees", 0)) if isinstance(orientation, dict) else 0
             self._orientation_degrees = 180 if degrees == 180 else 0
@@ -386,6 +391,8 @@ class PentacamAnnotationWorkspace:
             return
         self._push_undo()
         self._points[self._mode].append(original_point)
+        # A new boundary point invalidates the previous fitted ellipse.
+        self._ellipses[self._mode] = None
         self._mark_dirty()
         self._status_var.set(f"{self._mode}: {len(self._points[self._mode])} boundary points")
         self._refresh_canvas()
@@ -500,10 +507,16 @@ class PentacamAnnotationWorkspace:
 
     def _undo_point(self) -> None:
         if not self._undo_stack:
-            self._status_var.set("Nothing to undo")
-            return
-        self._redo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
-        self._points, self._ellipses = self._undo_stack.pop()
+            # Allow one-point-at-a-time undo for annotations loaded from disk.
+            if not self._points[self._mode]:
+                self._status_var.set("Nothing to undo")
+                return
+            self._redo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+            self._points[self._mode].pop()
+            self._ellipses[self._mode] = None
+        else:
+            self._redo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+            self._points, self._ellipses = self._undo_stack.pop()
         self._mark_dirty()
         self._refresh_canvas()
 
@@ -581,9 +594,10 @@ class PentacamAnnotationWorkspace:
             "detection_status": status,
             "annotations": annotations,
             "roi_box_norm": None,
-            "failure_reason": "",
+            "failure_reason": self._failure_reason_var.get().strip(),
             "annotator_id": self._annotator_var.get().strip(),
             "created_at": created_at,
+            "annotated_at": now,
             "updated_at": now,
             "orientation_transform": {
                 "display_rotation_degrees": self._orientation_degrees,
