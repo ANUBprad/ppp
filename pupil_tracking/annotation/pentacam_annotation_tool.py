@@ -27,6 +27,9 @@ from .workspace_core import (
     fit_ellipse_annotation,
     load_annotation_json,
     normalize_roi_box,
+    denormalize_roi_box,
+    display_to_original_point,
+    original_to_display_point,
     save_annotation_json,
     stable_image_id,
     transform_point,
@@ -79,6 +82,11 @@ class PentacamAnnotationWorkspace:
         self._photo_image: Optional[ImageTk.PhotoImage] = None
 
         self._orientation_degrees = 0
+        self._roi_box: Optional[tuple[int, int, int, int]] = None
+        self._roi_history: list[Optional[tuple[int, int, int, int]]] = []
+        self._roi_preview = False
+        self._roi_selection_mode = False
+        self._roi_drag_start: Optional[tuple[int, int]] = None
         self._scale = 1.0
         self._zoom = 1.0
         self._offset_x = 0.0
@@ -109,6 +117,7 @@ class PentacamAnnotationWorkspace:
         self._orientation_var = tk.StringVar(value="0")
         self._annotator_var = tk.StringVar(value="")
         self._failure_reason_var = tk.StringVar(value="")
+        self._roi_preview_var = tk.BooleanVar(value=False)
         self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
         self._counter_var = tk.StringVar(value="0 / 0 images")
 
@@ -142,7 +151,9 @@ class PentacamAnnotationWorkspace:
         canvas_panel.grid_rowconfigure(0, weight=1)
         self._canvas = tk.Canvas(canvas_panel, background="#17191d", cursor="crosshair", highlightthickness=0)
         self._canvas.grid(row=0, column=0, sticky="nsew")
-        self._canvas.bind("<Button-1>", self._on_click)
+        self._canvas.bind("<ButtonPress-1>", self._on_left_press)
+        self._canvas.bind("<B1-Motion>", self._on_left_motion)
+        self._canvas.bind("<ButtonRelease-1>", self._on_left_release)
         self._canvas.bind("<Button-3>", self._on_right_click)
         self._canvas.bind("<ButtonPress-2>", self._on_pan_start)
         self._canvas.bind("<B2-Motion>", self._on_pan_motion)
@@ -165,6 +176,24 @@ class PentacamAnnotationWorkspace:
         navigation.pack(fill="x")
         ttk.Button(navigation, text="◀ Previous", command=self._prev_image).pack(side="left", expand=True, fill="x")
         ttk.Button(navigation, text="Next ▶", command=self._next_image).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+        roi_frame = ttk.LabelFrame(controls, text="Region of interest (ROI)")
+        roi_frame.pack(fill="x", pady=(6, 0))
+        ttk.Button(roi_frame, text="Select / resize ROI (drag)", command=self._start_roi_selection).pack(
+            fill="x", padx=5, pady=2
+        )
+        roi_actions = ttk.Frame(roi_frame)
+        roi_actions.pack(fill="x", padx=5)
+        ttk.Button(roi_actions, text="Undo ROI", command=self._undo_roi).pack(
+            side="left", expand=True, fill="x"
+        )
+        ttk.Button(roi_actions, text="Clear ROI", command=self._clear_roi).pack(
+            side="left", expand=True, fill="x", padx=(4, 0)
+        )
+        ttk.Checkbutton(
+            roi_frame, text="Preview cropped ROI", variable=self._roi_preview_var,
+            command=self._on_roi_preview_toggle,
+        ).pack(anchor="w", padx=5, pady=2)
 
         ttk.Separator(controls).pack(fill="x", pady=8)
         ttk.Label(controls, text="Eye side").pack(anchor="w")
@@ -223,6 +252,7 @@ class PentacamAnnotationWorkspace:
         exports = ttk.LabelFrame(controls, text="Export (local files)")
         exports.pack(fill="x", pady=(0, 8))
         ttk.Button(exports, text="Export JSON…", command=self._export_json).pack(fill="x", padx=5, pady=2)
+        ttk.Button(exports, text="Export ROI crop…", command=self._export_crop).pack(fill="x", padx=5, pady=2)
         ttk.Button(exports, text="Export overlay PNG…", command=self._export_overlay).pack(fill="x", padx=5, pady=2)
         ttk.Button(exports, text="Export segmentation mask…", command=self._export_mask).pack(fill="x", padx=5, pady=2)
 
@@ -280,6 +310,10 @@ class PentacamAnnotationWorkspace:
         self.display_image = None
         self._points = {mode: [] for mode in ANNOTATION_MODES}
         self._ellipses = {mode: None for mode in ANNOTATION_MODES}
+        self._roi_box = None
+        self._roi_history.clear()
+        self._roi_preview = False
+        self._roi_preview_var.set(False)
         self._canvas.delete("all")
         self._image_label.config(text="No image loaded")
         self._counter_var.set(f"0 / {len(self._image_files)} images")
@@ -314,6 +348,12 @@ class PentacamAnnotationWorkspace:
         self._orientation_var.set("0")
         self._zoom = 1.0
         self._pan_x = self._pan_y = 0.0
+        self._roi_box = None
+        self._roi_history.clear()
+        self._roi_preview = False
+        self._roi_preview_var.set(False)
+        self._roi_selection_mode = False
+        self._roi_drag_start = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._points = {mode: [] for mode in ANNOTATION_MODES}
@@ -339,18 +379,25 @@ class PentacamAnnotationWorkspace:
         self._refresh_canvas()
 
     def _restore_saved_annotation(self) -> None:
+        self._loading_metadata = True
+        self._roi_box = None
+        self._roi_history.clear()
+        self._roi_preview = False
+        self._roi_preview_var.set(False)
         if self._annotation_path is None or not self._annotation_path.exists():
             self._loaded_document = None
             self._eye_var.set("OD")
             self._image_type_var.set(PentacamImageType.UNKNOWN.value)
             self._quality_var.set(PentacamQuality.NO_DETECTION.value)
+            self._annotator_var.set("")
+            self._failure_reason_var.set("")
+            self._loading_metadata = False
             return
         try:
             document = load_annotation_json(self._annotation_path)
             if document.get("image_id") != self.image_id:
                 raise AnnotationValidationError("saved annotation image_id does not match the selected image")
             self._loaded_document = document
-            self._loading_metadata = True
             self._eye_var.set(document.get("eye_side", "OD"))
             self._image_type_var.set(document.get("image_type", PentacamImageType.UNKNOWN.value))
             self._quality_var.set(document.get("quality_grade", PentacamQuality.NO_DETECTION.value))
@@ -360,42 +407,198 @@ class PentacamAnnotationWorkspace:
             degrees = int(orientation.get("display_rotation_degrees", 0)) if isinstance(orientation, dict) else 0
             self._orientation_degrees = 180 if degrees == 180 else 0
             self._orientation_var.set(str(self._orientation_degrees))
+            height, width = self.original_image.shape[:2]
+            roi_norm = document.get("roi_box_norm")
+            if roi_norm is not None:
+                self._roi_box = denormalize_roi_box(roi_norm, width, height)
+                self._roi_preview = True
+                self._roi_preview_var.set(True)
             for mode in ANNOTATION_MODES:
                 record = document.get("annotations", {}).get(mode, {})
                 self._points[mode] = [tuple(point) for point in record.get("boundary_points", [])]
                 self._ellipses[mode] = copy.deepcopy(record.get("ellipse"))
-            self._loading_metadata = False
             self._dirty = False
-            self._status_var.set("Restored saved annotation")
+            self._status_var.set("Restored saved annotation and ROI")
         except (OSError, ValueError, json.JSONDecodeError, AnnotationValidationError) as exc:
-            self._loading_metadata = False
             self._loaded_document = None
+            self._roi_box = None
+            self._roi_preview = False
+            self._roi_preview_var.set(False)
             self._status_var.set(f"Saved annotation could not be loaded: {exc}")
+        finally:
+            self._loading_metadata = False
         self._refresh_canvas()
 
     # ------------------------- Coordinate/UI ---------------------------
-    def _on_click(self, event: tk.Event) -> None:
+    def _view_dimensions(self) -> tuple[int, int]:
         if self.original_image is None:
-            return
-        display_x = (event.x - self._offset_x) / self._scale
-        display_y = (event.y - self._offset_y) / self._scale
+            return 0, 0
         height, width = self.original_image.shape[:2]
-        if not (0 <= display_x < width and 0 <= display_y < height):
-            return
-        original_point = transform_point(
-            (display_x, display_y), width, height, self._orientation_degrees, to_display=False
+        if self._roi_preview and self._roi_box is not None:
+            x0, y0, x1, y1 = self._roi_box
+            return x1 - x0, y1 - y0
+        return width, height
+
+    def _view_to_original(self, point: tuple[float, float]) -> tuple[float, float]:
+        if self.original_image is None:
+            raise AnnotationValidationError("no image is loaded")
+        height, width = self.original_image.shape[:2]
+        roi = self._roi_box if self._roi_preview else None
+        return display_to_original_point(
+            point, width, height, self._orientation_degrees, roi_box=roi
         )
+
+    def _original_to_view(self, point: tuple[float, float]) -> Optional[tuple[float, float]]:
+        if self.original_image is None:
+            return None
+        height, width = self.original_image.shape[:2]
+        roi = self._roi_box if self._roi_preview else None
+        return original_to_display_point(
+            point, width, height, self._orientation_degrees, roi_box=roi
+        )
+
+    def _canvas_to_view(self, event: tk.Event) -> tuple[float, float]:
+        return (
+            (event.x - self._offset_x) / self._scale,
+            (event.y - self._offset_y) / self._scale,
+        )
+
+    def _on_left_press(self, event: tk.Event) -> None:
+        if self._roi_selection_mode:
+            self._roi_drag_start = (event.x, event.y)
+            self._canvas.delete("roi-drag")
+
+    def _on_left_motion(self, event: tk.Event) -> None:
+        if not self._roi_selection_mode or self._roi_drag_start is None:
+            return
+        x0, y0 = self._roi_drag_start
+        self._canvas.delete("roi-drag")
+        self._canvas.create_rectangle(
+            x0, y0, event.x, event.y, outline="#00e5ff", width=2,
+            dash=(6, 3), tags="roi-drag",
+        )
+
+    def _on_left_release(self, event: tk.Event) -> None:
+        if self._roi_selection_mode:
+            self._finish_roi_selection(event)
+            return
+        self._on_click(event)
+
+    def _on_click(self, event: tk.Event) -> None:
+        if self.original_image is None or self._roi_selection_mode:
+            return
+        view_x, view_y = self._canvas_to_view(event)
+        view_width, view_height = self._view_dimensions()
+        if not (0 <= view_x < view_width and 0 <= view_y < view_height):
+            return
+        original_point = self._view_to_original((view_x, view_y))
+        height, width = self.original_image.shape[:2]
         try:
             validate_points([original_point], width, height)
         except AnnotationValidationError:
             return
         self._push_undo()
         self._points[self._mode].append(original_point)
-        # A new boundary point invalidates the previous fitted ellipse.
         self._ellipses[self._mode] = None
         self._mark_dirty()
         self._status_var.set(f"{self._mode}: {len(self._points[self._mode])} boundary points")
         self._refresh_canvas()
+
+    def _start_roi_selection(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image before selecting an ROI.")
+            return
+        self._roi_selection_mode = True
+        self._roi_drag_start = None
+        self._roi_preview = False
+        self._roi_preview_var.set(False)
+        self._canvas.configure(cursor="crosshair")
+        self._refresh_canvas()
+        self._status_var.set("Drag a rectangle around the eye image. Release to set or resize the ROI.")
+
+    def _finish_roi_selection(self, event: tk.Event) -> None:
+        self._canvas.delete("roi-drag")
+        start = self._roi_drag_start
+        self._roi_drag_start = None
+        self._roi_selection_mode = False
+        self._canvas.configure(cursor="crosshair")
+        if self.original_image is None or start is None:
+            return
+
+        start_view = (
+            (start[0] - self._offset_x) / self._scale,
+            (start[1] - self._offset_y) / self._scale,
+        )
+        end_view = self._canvas_to_view(event)
+        try:
+            start_original = self._view_to_original(start_view)
+            end_original = self._view_to_original(end_view)
+        except (AnnotationValidationError, ValueError):
+            self._status_var.set("ROI selection failed; try again inside the image.")
+            return
+
+        height, width = self.original_image.shape[:2]
+        x0 = max(0, min(width - 1, int(np.floor(min(start_original[0], end_original[0])))))
+        y0 = max(0, min(height - 1, int(np.floor(min(start_original[1], end_original[1])))))
+        x1 = max(x0 + 1, min(width, int(np.ceil(max(start_original[0], end_original[0]))) + 1))
+        y1 = max(y0 + 1, min(height, int(np.ceil(max(start_original[1], end_original[1]))) + 1))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            self._status_var.set("ROI is too small. Drag a larger rectangle.")
+            self._refresh_canvas()
+            return
+
+        try:
+            normalize_roi_box((x0, y0, x1, y1), width, height)
+        except AnnotationValidationError as exc:
+            self._status_var.set(f"Invalid ROI: {exc}")
+            return
+
+        self._roi_history.append(self._roi_box)
+        if len(self._roi_history) > 50:
+            self._roi_history.pop(0)
+        self._roi_box = (x0, y0, x1, y1)
+        self._roi_preview = True
+        self._roi_preview_var.set(True)
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._mark_dirty()
+        self._refresh_canvas()
+        self._status_var.set(f"ROI selected: {x1 - x0} × {y1 - y0} px in original image coordinates.")
+
+    def _undo_roi(self) -> None:
+        if not self._roi_history:
+            self._status_var.set("No previous ROI to restore")
+            return
+        self._roi_box = self._roi_history.pop()
+        self._roi_preview = self._roi_box is not None
+        self._roi_preview_var.set(self._roi_preview)
+        self._mark_dirty()
+        self._refresh_canvas()
+        self._status_var.set("Restored previous ROI")
+
+    def _clear_roi(self) -> None:
+        if self._roi_box is None:
+            return
+        self._roi_history.append(self._roi_box)
+        self._roi_box = None
+        self._roi_preview = False
+        self._roi_preview_var.set(False)
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._mark_dirty()
+        self._refresh_canvas()
+        self._status_var.set("ROI cleared; showing full image")
+
+    def _on_roi_preview_toggle(self) -> None:
+        if self._roi_preview_var.get() and self._roi_box is None:
+            self._roi_preview_var.set(False)
+            messagebox.showinfo("No ROI", "Select a rectangular ROI first.")
+            return
+        self._roi_preview = bool(self._roi_preview_var.get())
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._refresh_canvas()
+        self._status_var.set("Showing ROI crop preview" if self._roi_preview else "Showing full image")
 
     def _on_right_click(self, _event: tk.Event) -> None:
         self._undo_point()
@@ -415,10 +618,6 @@ class PentacamAnnotationWorkspace:
         if degrees not in (0, 180):
             raise ValueError("only 0- and 180-degree orientation is supported")
         self._orientation_degrees = degrees
-        if self.original_image is not None:
-            self.display_image = (
-                cv2.flip(self.original_image, -1) if degrees == 180 else self.original_image.copy()
-            )
         self._mark_dirty()
         self._refresh_canvas()
 
@@ -428,46 +627,63 @@ class PentacamAnnotationWorkspace:
     def _refresh_canvas(self) -> None:
         if self.original_image is None:
             return
+        height, width = self.original_image.shape[:2]
+        if self._roi_preview and self._roi_box is not None:
+            x0, y0, x1, y1 = self._roi_box
+            view_image = self.original_image[y0:y1, x0:x1].copy()
+            view_width, view_height = x1 - x0, y1 - y0
+        else:
+            view_image = self.original_image.copy()
+            view_width, view_height = width, height
+
+        display = cv2.flip(view_image, -1) if self._orientation_degrees == 180 else view_image
         canvas_width = max(1, self._canvas.winfo_width())
         canvas_height = max(1, self._canvas.winfo_height())
-        height, width = self.original_image.shape[:2]
-        base_scale = min(canvas_width / width, canvas_height / height)
+        base_scale = min(canvas_width / view_width, canvas_height / view_height)
         self._scale = max(0.01, min(base_scale * self._zoom, 8.0))
-        scaled_width = max(1, int(round(width * self._scale)))
-        scaled_height = max(1, int(round(height * self._scale)))
+        scaled_width = max(1, int(round(view_width * self._scale)))
+        scaled_height = max(1, int(round(view_height * self._scale)))
         self._offset_x = (canvas_width - scaled_width) / 2 + self._pan_x
         self._offset_y = (canvas_height - scaled_height) / 2 + self._pan_y
 
-        display = (
-            cv2.flip(self.original_image, -1)
-            if self._orientation_degrees == 180
-            else self.original_image.copy()
-        )
         for mode in ANNOTATION_MODES:
             color = MODE_COLORS[mode]
-            displayed_points = [
-                transform_point(point, width, height, self._orientation_degrees)
-                for point in self._points[mode]
-            ]
-            for x, y in displayed_points:
-                cv2.circle(display, (int(round(x)), int(round(y))), 3, color, -1)
+            for point in self._points[mode]:
+                view_point = self._original_to_view(point)
+                if view_point is not None:
+                    cv2.circle(
+                        display, (int(round(view_point[0])), int(round(view_point[1]))),
+                        3, color, -1,
+                    )
             ellipse = self._ellipses[mode]
             if ellipse:
-                center = transform_point(
-                    (ellipse["center_x"], ellipse["center_y"]),
-                    width, height, self._orientation_degrees,
-                )
-                axes = (
-                    max(1, int(round(ellipse["semi_major"]))),
-                    max(1, int(round(ellipse["semi_minor"]))),
-                )
-                cv2.ellipse(
-                    display, (int(round(center[0])), int(round(center[1]))),
-                    axes, float(ellipse["angle_deg"]), 0, 360, color, 2,
-                )
+                center = self._original_to_view((ellipse["center_x"], ellipse["center_y"]))
+                if center is not None:
+                    axes = (
+                        max(1, int(round(ellipse["semi_major"]))),
+                        max(1, int(round(ellipse["semi_minor"]))),
+                    )
+                    cv2.ellipse(
+                        display, (int(round(center[0]), int(round(center[1]))),
+                        axes, float(ellipse["angle_deg"]), 0, 360, color, 2,
+                    )
+
+        if self._roi_box is not None and not self._roi_preview:
+            x0, y0, x1, y1 = self._roi_box
+            p0 = transform_point((x0, y0), width, height, self._orientation_degrees)
+            p1 = transform_point((x1 - 1, y1 - 1), width, height, self._orientation_degrees)
+            cv2.rectangle(
+                display, (int(round(p0[0])), int(round(p0[1]))),
+                (int(round(p1[0])), int(round(p1[1]))), (255, 220, 0), 2,
+            )
+        if self._roi_preview:
+            cv2.putText(display, "ROI CROP PREVIEW", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 230, 255), 2)
 
         self.display_image = display
-        resized = cv2.resize(display, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA if self._scale < 1 else cv2.INTER_CUBIC)
+        resized = cv2.resize(
+            display, (scaled_width, scaled_height),
+            interpolation=cv2.INTER_AREA if self._scale < 1 else cv2.INTER_CUBIC,
+        )
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         self._photo_image = ImageTk.PhotoImage(Image.fromarray(rgb))
         self._canvas.delete("all")
@@ -593,7 +809,11 @@ class PentacamAnnotationWorkspace:
             "quality_grade": self._quality_var.get(),
             "detection_status": status,
             "annotations": annotations,
-            "roi_box_norm": None,
+            "roi_box_norm": (
+                normalize_roi_box(self._roi_box, width, height)
+                if self._roi_box is not None else None
+            ),
+            "roi_coordinate_system": "original_image_normalized_half_open_xyxy",
             "failure_reason": self._failure_reason_var.get().strip(),
             "annotator_id": self._annotator_var.get().strip(),
             "created_at": created_at,
@@ -711,6 +931,9 @@ class PentacamAnnotationWorkspace:
         if self.original_image is None:
             raise AnnotationValidationError("no image is loaded")
         overlay = self.original_image.copy()
+        if self._roi_box is not None:
+            x0, y0, x1, y1 = self._roi_box
+            cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (255, 220, 0), 2)
         for mode in ANNOTATION_MODES:
             color = MODE_COLORS[mode]
             for x, y in self._points[mode]:
@@ -721,6 +944,30 @@ class PentacamAnnotationWorkspace:
                 axes = (max(1, int(round(ellipse["semi_major"]))), max(1, int(round(ellipse["semi_minor"]))))
                 cv2.ellipse(overlay, center, axes, ellipse["angle_deg"], 0, 360, color, 2)
         return overlay
+
+    def _export_crop(self) -> None:
+        """Export the raw ROI crop in original image orientation."""
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+        if self._roi_box is None:
+            messagebox.showinfo("No ROI", "Select an ROI before exporting a crop.")
+            return
+        x0, y0, x1, y1 = self._roi_box
+        crop = self.original_image[y0:y1, x0:x1].copy()
+        path = filedialog.asksaveasfilename(
+            title="Export ROI crop (original orientation)",
+            defaultextension=".png",
+            initialfile=f"{self.image_id}_crop.png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._write_image(Path(path), crop)
+            self._status_var.set(f"ROI crop exported: {x1 - x0} × {y1 - y0} px")
+        except OSError as exc:
+            messagebox.showerror("Crop export error", str(exc))
 
     def _export_overlay(self) -> None:
         if self.original_image is None:
@@ -746,16 +993,20 @@ class PentacamAnnotationWorkspace:
             return
         try:
             document = self._build_annotation_document()
-            mask = build_segmentation_mask(document)
+            mask = build_segmentation_mask(document, roi_box=self._roi_box)
+            suffix = "_roi_mask.png" if self._roi_box is not None else "_mask.png"
             path = filedialog.asksaveasfilename(
-                title="Export segmentation mask (class IDs 0–3)",
+                title="Export segmentation mask (class IDs 0–3; ROI crop if selected)",
                 defaultextension=".png",
-                initialfile=f"{self.image_id}_mask.png",
+                initialfile=f"{self.image_id}{suffix}",
                 filetypes=[("PNG", "*.png")],
             )
             if path:
                 self._write_image(Path(path), mask)
-                self._status_var.set("Segmentation mask exported (0=background, 1=pupil, 2=iris, 3=ring outline)")
+                self._status_var.set(
+                    f"Segmentation mask exported: {mask.shape[1]} × {mask.shape[0]} px "
+                    "(0=background, 1=pupil, 2=iris, 3=ring outline)"
+                )
         except (OSError, AnnotationValidationError, TypeError, ValueError) as exc:
             messagebox.showerror("Mask export error", str(exc))
 
