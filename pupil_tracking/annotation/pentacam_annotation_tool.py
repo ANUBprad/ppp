@@ -95,6 +95,7 @@ class PentacamAnnotationWorkspace:
             mode: None for mode in ANNOTATION_MODES
         }
         self._undo_stack: list[tuple[dict[str, list[tuple[float, float]]], dict[str, Any]]] = []
+        self._redo_stack: list[tuple[dict[str, list[tuple[float, float]]], dict[str, Any]]] = []
         self._loaded_document: Optional[dict[str, Any]] = None
         self._annotation_path: Optional[Path] = None
         self._dirty = False
@@ -193,7 +194,8 @@ class PentacamAnnotationWorkspace:
         actions = ttk.LabelFrame(controls, text="Annotation")
         actions.pack(fill="x", pady=8)
         ttk.Button(actions, text="Fit ellipse (≥5 points)", command=self._fit_ellipse).pack(fill="x", padx=5, pady=2)
-        ttk.Button(actions, text="Undo last point", command=self._undo_point).pack(fill="x", padx=5, pady=2)
+        ttk.Button(actions, text="Undo", command=self._undo_point).pack(fill="x", padx=5, pady=2)
+        ttk.Button(actions, text="Redo", command=self._redo_point).pack(fill="x", padx=5, pady=2)
         ttk.Button(actions, text="Clear current structure", command=self._clear_current).pack(fill="x", padx=5, pady=2)
         ttk.Button(actions, text="Save annotation", command=self._save_annotation).pack(fill="x", padx=5, pady=2)
 
@@ -252,12 +254,13 @@ class PentacamAnnotationWorkspace:
             self._load_image(0)
 
     def _load_dataset_dir(self, dataset_dir: Path) -> None:
+        resolved_dir = dataset_dir.expanduser().resolve()
         try:
-            images = discover_images(dataset_dir)
+            images = discover_images(resolved_dir)
         except (OSError, NotADirectoryError) as exc:
             messagebox.showerror("Dataset error", str(exc))
             return
-        self.dataset_dir = dataset_dir.expanduser().resolve()
+        self.dataset_dir = resolved_dir
         self._image_files = images
         self._image_index = -1
         if not images:
@@ -308,6 +311,7 @@ class PentacamAnnotationWorkspace:
         self._zoom = 1.0
         self._pan_x = self._pan_y = 0.0
         self._undo_stack.clear()
+        self._redo_stack.clear()
         self._points = {mode: [] for mode in ANNOTATION_MODES}
         self._ellipses = {mode: None for mode in ANNOTATION_MODES}
 
@@ -490,18 +494,26 @@ class PentacamAnnotationWorkspace:
     # -------------------------- Annotation -----------------------------
     def _push_undo(self) -> None:
         self._undo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+        self._redo_stack.clear()
         if len(self._undo_stack) > 100:
             self._undo_stack.pop(0)
 
     def _undo_point(self) -> None:
         if not self._undo_stack:
-            if self._points[self._mode]:
-                self._push_undo()
-                self._points[self._mode].pop()
-                self._mark_dirty()
-        else:
-            self._points, self._ellipses = self._undo_stack.pop()
-            self._mark_dirty()
+            self._status_var.set("Nothing to undo")
+            return
+        self._redo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+        self._points, self._ellipses = self._undo_stack.pop()
+        self._mark_dirty()
+        self._refresh_canvas()
+
+    def _redo_point(self) -> None:
+        if not self._redo_stack:
+            self._status_var.set("Nothing to redo")
+            return
+        self._undo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+        self._points, self._ellipses = self._redo_stack.pop()
+        self._mark_dirty()
         self._refresh_canvas()
 
     def _clear_current(self) -> None:
@@ -555,8 +567,10 @@ class PentacamAnnotationWorkspace:
             else "NO_PUPIL" if not self._ellipses["pupil"]
             else "NO_LIMBUS"
         )
+        previous_revision = int(self._loaded_document.get("revision", 0)) if self._loaded_document else 0
         document = {
             "schema_version": SCHEMA_VERSION,
+            "revision": previous_revision + 1,
             "image_id": self.image_id,
             "image_width": width,
             "image_height": height,

@@ -71,6 +71,12 @@ def test_stable_image_ids_are_deterministic_and_path_specific():
     assert len(stable_image_id("case_a/image.bmp")) == 24
 
 
+@pytest.mark.parametrize("unsafe_path", ["../patient/image.bmp", "/absolute/image.bmp", ""])
+def test_stable_image_id_rejects_unsafe_paths(unsafe_path):
+    with pytest.raises(ValueError):
+        stable_image_id(unsafe_path)
+
+
 def test_discover_images_filters_extensions_and_private_artifacts(tmp_path):
     (tmp_path / "a.JPG").write_bytes(b"not decoded here")
     (tmp_path / "b.tiff").write_bytes(b"not decoded here")

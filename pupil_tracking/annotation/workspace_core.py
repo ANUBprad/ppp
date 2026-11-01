@@ -47,10 +47,14 @@ def discover_images(dataset_dir: Path | str) -> list[Path]:
 
 
 def stable_image_id(relative_path: str | Path) -> str:
-    """Create a stable, non-reversible identifier from a dataset-relative path."""
-    normalized = str(relative_path).replace("\\", "/").lstrip("./")
-    if not normalized or normalized.startswith("/"):
-        raise ValueError("relative_path must be a non-empty relative path")
+    """Create a stable, non-reversible identifier from a safe relative path."""
+    from pathlib import PurePosixPath
+
+    normalized = str(relative_path).replace("\\", "/")
+    relative = PurePosixPath(normalized)
+    if relative.is_absolute() or not relative.parts or any(part == ".." for part in relative.parts):
+        raise ValueError("relative_path must be a non-empty path without traversal")
+    normalized = relative.as_posix()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
