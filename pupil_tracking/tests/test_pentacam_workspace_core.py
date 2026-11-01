@@ -9,6 +9,9 @@ import pytest
 from pupil_tracking.annotation.workspace_core import (
     AnnotationValidationError,
     build_segmentation_mask,
+    denormalize_roi_box,
+    display_to_original_point,
+    original_to_display_point,
     discover_images,
     fit_ellipse_annotation,
     load_annotation_json,
@@ -126,6 +129,60 @@ def test_roi_normalization_clamps_and_normalizes():
 def test_roi_normalization_rejects_degenerate_box():
     with pytest.raises(AnnotationValidationError, match="positive"):
         normalize_roi_box((10, 10, 10, 20), 100, 80)
+
+
+def test_roi_normalize_denormalize_round_trip():
+    pixel_box = (120, 80, 900, 700)
+    normalized = normalize_roi_box(pixel_box, 1200, 838)
+    assert denormalize_roi_box(normalized, 1200, 838) == pixel_box
+
+
+def test_denormalize_roi_rejects_out_of_range_coordinates():
+    with pytest.raises(AnnotationValidationError, match="within"):
+        denormalize_roi_box((-0.1, 0.1, 0.8, 0.9), 100, 80)
+
+
+def test_roi_coordinate_mapping_preserves_source_points_at_zero_degrees():
+    roi = (100, 50, 500, 350)
+    source = display_to_original_point((25.5, 40.25), 800, 600, 0, roi)
+    assert source == pytest.approx((125.5, 90.25))
+    assert original_to_display_point(source, 800, 600, 0, roi) == pytest.approx((25.5, 40.25))
+
+
+def test_roi_coordinate_mapping_round_trips_after_180_degree_rotation():
+    roi = (100, 50, 500, 350)
+    display_point = (12.25, 18.5)
+    source = display_to_original_point(display_point, 800, 600, 180, roi)
+    assert source == pytest.approx((487.75, 331.5))
+    assert original_to_display_point(source, 800, 600, 180, roi) == pytest.approx(display_point)
+
+
+def test_original_point_outside_roi_is_not_drawn_in_crop_preview():
+    roi = (100, 50, 500, 350)
+    assert original_to_display_point((99.5, 100), 800, 600, 0, roi) is None
+
+
+def test_document_validation_accepts_and_rejects_normalized_roi():
+    document = _document()
+    document["roi_box_norm"] = [0.1, 0.1, 0.9, 0.9]
+    validate_annotation_document(document)
+    document["roi_box_norm"] = [0.8, 0.2, 0.2, 0.9]
+    with pytest.raises(AnnotationValidationError, match="positive"):
+        validate_annotation_document(document)
+
+
+def test_roi_mask_is_cropped_and_uses_original_coordinate_offset():
+    document = _document()
+    cropped = build_segmentation_mask(document, roi_box=(40, 30, 80, 70))
+    assert cropped.shape == (40, 40)
+    assert cropped.dtype == np.uint8
+    assert cropped[10, 10] == 1
+    assert cropped[10, 30] == 2
+
+
+def test_roi_mask_rejects_invalid_pixel_bounds():
+    with pytest.raises(AnnotationValidationError, match="outside"):
+        build_segmentation_mask(_document(), roi_box=(90, 70, 110, 90))
 
 
 def test_document_validation_accepts_valid_schema():

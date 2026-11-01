@@ -664,7 +664,7 @@ class PentacamAnnotationWorkspace:
                         max(1, int(round(ellipse["semi_minor"]))),
                     )
                     cv2.ellipse(
-                        display, (int(round(center[0]), int(round(center[1]))),
+                        display, (int(round(center[0])), int(round(center[1]))),
                         axes, float(ellipse["angle_deg"]), 0, 360, color, 2,
                     )
 
