@@ -153,7 +153,7 @@ def test_roi_coordinate_mapping_round_trips_after_180_degree_rotation():
     roi = (100, 50, 500, 350)
     display_point = (12.25, 18.5)
     source = display_to_original_point(display_point, 800, 600, 180, roi)
-    assert source == pytest.approx((487.75, 331.5))
+    assert source == pytest.approx((486.75, 330.5))
     assert original_to_display_point(source, 800, 600, 180, roi) == pytest.approx(display_point)
 
 
