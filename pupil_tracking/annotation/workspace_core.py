@@ -204,7 +204,7 @@ def normalize_roi_box(
     width: int,
     height: int,
 ) -> list[float]:
-    """Normalize an xyxy ROI to [0, 1], clamping it to image boundaries."""
+    """Normalize a half-open xyxy ROI to [0, 1] in original-image space."""
     width, height = _image_dimensions(width, height)
     if len(box) != 4:
         raise AnnotationValidationError("ROI box must be [x_min, y_min, x_max, y_max]")
@@ -221,6 +221,31 @@ def normalize_roi_box(
     return [x0 / width, y0 / height, x1 / width, y1 / height]
 
 
+def denormalize_roi_box(
+    box_norm: Sequence[float],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    """Convert normalized half-open xyxy ROI coordinates to integer pixels."""
+    width, height = _image_dimensions(width, height)
+    if len(box_norm) != 4:
+        raise AnnotationValidationError("normalized ROI must contain four values")
+    try:
+        values = [float(value) for value in box_norm]
+    except (TypeError, ValueError) as exc:
+        raise AnnotationValidationError("normalized ROI coordinates must be numeric") from exc
+    if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in values):
+        raise AnnotationValidationError("normalized ROI coordinates must be finite and within [0, 1]")
+    x0, y0, x1, y1 = values
+    if x1 <= x0 or y1 <= y0:
+        raise AnnotationValidationError("ROI box must have positive width and height")
+    left = max(0, min(width - 1, int(math.floor(x0 * width))))
+    top = max(0, min(height - 1, int(math.floor(y0 * height))))
+    right = max(left + 1, min(width, int(math.ceil(x1 * width))))
+    bottom = max(top + 1, min(height, int(math.ceil(y1 * height))))
+    return left, top, right, bottom
+
+
 def validate_annotation_document(document: Mapping[str, Any]) -> None:
     """Validate the versioned workspace document before persistence/export."""
     if not isinstance(document, Mapping):
@@ -235,6 +260,10 @@ def validate_annotation_document(document: Mapping[str, Any]) -> None:
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AnnotationValidationError("positive image_width and image_height are required") from exc
+
+    roi_box_norm = document.get("roi_box_norm")
+    if roi_box_norm is not None:
+        denormalize_roi_box(roi_box_norm, width, height)
 
     annotations = document.get("annotations", {})
     if not isinstance(annotations, Mapping):
@@ -301,35 +330,59 @@ def load_annotation_json(path: Path | str) -> dict[str, Any]:
     return dict(document)
 
 
-def build_segmentation_mask(document: Mapping[str, Any]) -> np.ndarray:
+def build_segmentation_mask(
+    document: Mapping[str, Any],
+    roi_box: Sequence[int] | None = None,
+) -> np.ndarray:
     """Rasterize manually annotated ellipses into a uint8 class mask.
 
-    Class IDs: 0 background, 1 pupil, 2 iris region inside the limbus, and
-    3 manually annotated suction-ring outline. The ring is drawn as an outline
-    so it does not overwrite the pupil/iris regions with a filled ellipse.
+    *roi_box* is a half-open [x0, y0, x1, y1] rectangle in original-image
+    pixels. When supplied, the returned mask has the exact crop dimensions.
+    Class IDs: 0 background, 1 pupil, 2 iris region inside limbus, 3 ring outline.
     """
     validate_annotation_document(document)
     width, height = int(document["image_width"]), int(document["image_height"])
-    mask = np.zeros((height, width), dtype=np.uint8)
+    if roi_box is None:
+        x0, y0, x1, y1 = 0, 0, width, height
+    else:
+        if len(roi_box) != 4:
+            raise AnnotationValidationError("ROI box must be [x_min, y_min, x_max, y_max]")
+        try:
+            x0, y0, x1, y1 = (int(value) for value in roi_box)
+        except (TypeError, ValueError) as exc:
+            raise AnnotationValidationError("ROI pixel coordinates must be integers") from exc
+        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+            raise AnnotationValidationError("ROI pixel box is outside the image or degenerate")
+
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
     annotations = document.get("annotations", {})
 
-    limbus = annotations.get("limbus", {}).get("ellipse")
-    if limbus:
-        center = (int(round(limbus["center_x"])), int(round(limbus["center_y"])))
-        axes = (max(1, int(round(limbus["semi_major"]))), max(1, int(round(limbus["semi_minor"]))))
-        cv2.ellipse(mask, center, axes, float(limbus["angle_deg"]), 0, 360, 2, thickness=-1)
+    def draw_ellipse(mode: str, label: int, thickness: int) -> None:
+        record = annotations.get(mode, {})
+        ellipse = record.get("ellipse") if isinstance(record, Mapping) else None
+        if not ellipse:
+            return
+        center = (
+            int(round(float(ellipse["center_x"]) - x0)),
+            int(round(float(ellipse["center_y"]) - y0)),
+        )
+        axes = (
+            max(1, int(round(float(ellipse["semi_major"])))),
+            max(1, int(round(float(ellipse["semi_minor"])))),
+        )
+        cv2.ellipse(
+            mask, center, axes, float(ellipse["angle_deg"]), 0, 360,
+            label, thickness=thickness,
+        )
 
-    ring = annotations.get("ring", {}).get("ellipse")
+    draw_ellipse("limbus", 2, -1)
+    ring_record = annotations.get("ring", {})
+    ring = ring_record.get("ellipse") if isinstance(ring_record, Mapping) else None
     if ring:
-        center = (int(round(ring["center_x"])), int(round(ring["center_y"])))
-        axes = (max(1, int(round(ring["semi_major"]))), max(1, int(round(ring["semi_minor"]))))
-        thickness = max(2, int(round(min(axes) * 0.04)))
-        cv2.ellipse(mask, center, axes, float(ring["angle_deg"]), 0, 360, 3, thickness=thickness)
-
-    pupil = annotations.get("pupil", {}).get("ellipse")
-    if pupil:
-        center = (int(round(pupil["center_x"])), int(round(pupil["center_y"])))
-        axes = (max(1, int(round(pupil["semi_major"]))), max(1, int(round(pupil["semi_minor"]))))
-        cv2.ellipse(mask, center, axes, float(pupil["angle_deg"]), 0, 360, 1, thickness=-1)
-
+        ring_axes = (
+            max(1, int(round(float(ring["semi_major"])))),
+            max(1, int(round(float(ring["semi_minor"])))),
+        )
+        draw_ellipse("ring", 3, max(2, int(round(min(ring_axes) * 0.04))))
+    draw_ellipse("pupil", 1, -1)
     return mask
