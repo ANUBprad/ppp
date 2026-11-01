@@ -90,6 +90,52 @@ def transform_point(
     return float(width - 1) - x, float(height - 1) - y
 
 
+def display_to_original_point(
+    point: Sequence[float],
+    width: int,
+    height: int,
+    rotation_degrees: int = 0,
+    roi_box: Sequence[int] | None = None,
+) -> tuple[float, float]:
+    """Map a point in the current full-image/ROI display view to source pixels."""
+    width, height = _image_dimensions(width, height)
+    if roi_box is None:
+        return transform_point(point, width, height, rotation_degrees, to_display=False)
+    if len(roi_box) != 4:
+        raise AnnotationValidationError("ROI box must contain four pixel coordinates")
+    x0, y0, x1, y1 = (int(value) for value in roi_box)
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise AnnotationValidationError("ROI pixel box is outside the image or degenerate")
+    local_x, local_y = transform_point(
+        point, x1 - x0, y1 - y0, rotation_degrees, to_display=False
+    )
+    return x0 + local_x, y0 + local_y
+
+
+def original_to_display_point(
+    point: Sequence[float],
+    width: int,
+    height: int,
+    rotation_degrees: int = 0,
+    roi_box: Sequence[int] | None = None,
+) -> tuple[float, float] | None:
+    """Map a source-image point to the current view; return None outside an ROI."""
+    width, height = _image_dimensions(width, height)
+    if roi_box is None:
+        return transform_point(point, width, height, rotation_degrees)
+    if len(roi_box) != 4:
+        raise AnnotationValidationError("ROI box must contain four pixel coordinates")
+    x0, y0, x1, y1 = (int(value) for value in roi_box)
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise AnnotationValidationError("ROI pixel box is outside the image or degenerate")
+    if len(point) != 2:
+        raise ValueError("point must contain exactly x and y")
+    x, y = float(point[0]), float(point[1])
+    if not (x0 <= x < x1 and y0 <= y < y1):
+        return None
+    return transform_point((x - x0, y - y0), x1 - x0, y1 - y0, rotation_degrees)
+
+
 def validate_points(
     points: Iterable[Sequence[float]],
     width: int,
