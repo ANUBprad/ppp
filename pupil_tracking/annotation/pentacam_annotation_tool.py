@@ -160,9 +160,43 @@ class PentacamAnnotationWorkspace:
         self._canvas.bind("<MouseWheel>", self._on_mousewheel)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
-        controls = ttk.Frame(body, width=300)
-        controls.grid(row=0, column=1, sticky="ns")
-        controls.grid_propagate(False)
+        controls_outer = ttk.Frame(body, width=320)
+        controls_outer.grid(row=0, column=1, sticky="ns")
+        controls_outer.grid_propagate(False)
+        controls_canvas = tk.Canvas(
+            controls_outer, width=300, highlightthickness=0, borderwidth=0
+        )
+        controls_scrollbar = ttk.Scrollbar(
+            controls_outer, orient="vertical", command=controls_canvas.yview
+        )
+        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        controls_canvas.pack(side="left", fill="both", expand=True)
+        controls_scrollbar.pack(side="right", fill="y")
+        controls = ttk.Frame(controls_canvas)
+        controls_window = controls_canvas.create_window(
+            (0, 0), window=controls, anchor="nw"
+        )
+
+        def _refresh_controls_scrollregion(_event: Any = None) -> None:
+            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+
+        def _fit_controls_width(event: tk.Event) -> None:
+            controls_canvas.itemconfigure(controls_window, width=event.width)
+
+        def _scroll_controls(event: tk.Event) -> None:
+            if event.delta:
+                controls_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _enable_controls_wheel(_event: tk.Event) -> None:
+            self.root.bind_all("<MouseWheel>", _scroll_controls)
+
+        def _disable_controls_wheel(_event: tk.Event) -> None:
+            self.root.unbind_all("<MouseWheel>")
+
+        controls.bind("<Configure>", _refresh_controls_scrollregion)
+        controls_canvas.bind("<Configure>", _fit_controls_width)
+        controls_outer.bind("<Enter>", _enable_controls_wheel)
+        controls_outer.bind("<Leave>", _disable_controls_wheel)
 
         ttk.Label(controls, text="Dataset").pack(anchor="w", pady=(0, 3))
         ttk.Button(controls, text="Open dataset folder…", command=self._open_dataset_directory).pack(fill="x")
