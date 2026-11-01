@@ -1,871 +1,756 @@
+"""Manual Pentacam image annotation workspace.
+
+The original image is immutable. All point coordinates and fitted ellipses are
+stored in original-image pixel coordinates; 0/180-degree rotation is a
+reversible display-only transform. Annotation JSON and drafts are written to
+a local private directory and must not be committed with clinical data.
+"""
 from __future__ import annotations
 
+import copy
 import json
-import math
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-from enum import Enum
+from tkinter import filedialog, messagebox, ttk
+from typing import Any, Optional
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from pupil_tracking.utils.logger import get_logger
-from pupil_tracking.pentacam.types import (
-    PentacamImageType,
-    PentacamDetectionStatus,
-    PentacamQuality,
-    PentacamGeometry,
-    PentacamFeature,
-    PentacamFeatureSet,
-    PentacamDetectionResult,
+from pupil_tracking.pentacam.types import PentacamImageType, PentacamQuality
+from .workspace_core import (
+    AnnotationValidationError,
+    build_segmentation_mask,
+    discover_images,
+    fit_ellipse_annotation,
+    load_annotation_json,
+    normalize_roi_box,
+    save_annotation_json,
+    stable_image_id,
+    transform_point,
+    validate_annotation_document,
+    validate_points,
 )
 
-logger = get_logger()
+APP_TITLE = "Pentacam Manual Annotation Workspace"
+SCHEMA_VERSION = "1.1"
+ANNOTATION_MODES = ("pupil", "limbus", "ring")
+MODE_COLORS = {
+    "pupil": (0, 220, 80),
+    "limbus": (255, 150, 0),
+    "ring": (0, 80, 255),
+}
 
 
-# ── Pentacam-specific enums and constants ────────────────────────────────
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-class WorkspaceAnnotationSchemaVersion(str, Enum):
-    """Version of the annotation schema used by this workspace."""
-    V1_0 = "1.0"
-    V1_1 = "1.1"  # added orientation_transform, annotator_id
-
-
-# ── Main Workspace Window ────────────────────────────────────────────────
 
 class PentacamAnnotationWorkspace:
-    """Pentacam manual annotation workspace.
-
-    Extends AnnotationTool with:
-    - Image-type classification (PentacamImageType)
-    - Quality grading (PentacamQuality)
-    - OD/OS eye-side selection
-    - 180° orientation handling with coordinate transform preservation
-    - Versioned annotation persistence
-    - Batch navigation
-    - Export capabilities
-    """
+    """Tkinter dataset browser and manual ellipse annotation workspace."""
 
     def __init__(
         self,
         root: tk.Tk,
         dataset_dir: Optional[Path] = None,
+        annotation_dir: Optional[Path] = None,
     ) -> None:
         self.root = root
-        self.root.title("Pentacam Manual Annotation Workspace")
-        self.root.geometry("1400x900")
+        self.root.title(APP_TITLE)
+        self.root.geometry("1500x920")
+        self.root.minsize(1000, 650)
 
-        self.dataset_dir: Optional[Path] = dataset_dir
-        self.patient_eye: Optional[Tuple[str, str]] = None  # (OD/OS, patient_id)
+        self.dataset_dir = Path(dataset_dir).expanduser().resolve() if dataset_dir else None
+        self.annotation_dir = (
+            Path(annotation_dir).expanduser().resolve()
+            if annotation_dir
+            else (Path.cwd() / ".pentacam_annotations").resolve()
+        )
+        self.annotation_dir.mkdir(parents=True, exist_ok=True)
+
+        self._image_files: list[Path] = []
+        self._image_index = -1
         self.current_image_path: Optional[Path] = None
-        self.original_image: Optional[np.ndarray] = None  # canonical, unmodified
-        self.display_image: Optional[np.ndarray] = None  # may be flipped/rotated
-        self.annotation_result: Optional[PentacamDetectionResult] = None
+        self.image_id: Optional[str] = None
+        self.original_image: Optional[np.ndarray] = None
+        self.display_image: Optional[np.ndarray] = None
+        self._photo_image: Optional[ImageTk.PhotoImage] = None
 
-        # Orientation state
-        self._orientation_degrees: float = 0.0  # 0 or 180, user-applied
-        self._orientation_applied: bool = False  # whether flip has been done
+        self._orientation_degrees = 0
+        self._scale = 1.0
+        self._zoom = 1.0
+        self._offset_x = 0.0
+        self._offset_y = 0.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_anchor: Optional[tuple[int, int]] = None
 
-        # UI state
-        self._image_index: int = -1
-        self._image_files: List[Path] = []
-        self._annotations_by_image: Dict[str, Dict[str, Any]] = {}
+        self._mode = "pupil"
+        self._points: dict[str, list[tuple[float, float]]] = {
+            mode: [] for mode in ANNOTATION_MODES
+        }
+        self._ellipses: dict[str, Optional[dict[str, float]]] = {
+            mode: None for mode in ANNOTATION_MODES
+        }
+        self._undo_stack: list[tuple[dict[str, list[tuple[float, float]]], dict[str, Any]]] = []
+        self._loaded_document: Optional[dict[str, Any]] = None
+        self._annotation_path: Optional[Path] = None
+        self._dirty = False
+        self._autosave_job: Optional[str] = None
+        self._loading_metadata = False
 
-        # Mode state
-        self._mode: str = "pupil"  # "pupil" | "limbus" | "ring"
-        self._pupil_points: List[Tuple[float, float]] = []
-        self._limbus_points: List[Tuple[float, float]] = []
-        self._ring_points: List[Tuple[float, float]] = []
+        self._eye_var = tk.StringVar(value="OD")
+        self._image_type_var = tk.StringVar(value=PentacamImageType.UNKNOWN.value)
+        self._quality_var = tk.StringVar(value=PentacamQuality.NO_DETECTION.value)
+        self._mode_var = tk.StringVar(value="pupil")
+        self._orientation_var = tk.StringVar(value="0")
+        self._annotator_var = tk.StringVar(value="")
+        self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
+        self._counter_var = tk.StringVar(value="0 / 0 images")
 
         self._build_ui()
+        for variable in (
+            self._eye_var,
+            self._image_type_var,
+            self._quality_var,
+            self._annotator_var,
+        ):
+            variable.trace_add("write", self._on_metadata_changed)
 
-        # If a dataset directory was provided, pre-load file list
-        if dataset_dir is not None:
-            self._load_dataset_dir(dataset_dir)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.dataset_dir is not None:
+            self._load_dataset_dir(self.dataset_dir)
 
-    # ── UI Construction ──────────────────────────────────────────────────
-
+    # ------------------------------ UI ---------------------------------
     def _build_ui(self) -> None:
-        # Main layout: left panel = image canvas, right panel = controls
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        # Left: canvas frame
-        self.canvas_frame = ttk.LabelFrame(self.root, text="Image Canvas")
-        self.canvas_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.canvas_frame.grid_rowconfigure(0, weight=1)
-        self.canvas_frame.grid_columnconfigure(0, weight=1)
+        body = ttk.Frame(self.root, padding=6)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-        self._canvas = tk.Canvas(
-            self.canvas_frame,
-            bg="#1a1a1a",
-            cursor="crosshair",
-            highlightthickness=0,
-        )
+        canvas_panel = ttk.LabelFrame(body, text="Original image (annotations use original pixel coordinates)")
+        canvas_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        canvas_panel.grid_columnconfigure(0, weight=1)
+        canvas_panel.grid_rowconfigure(0, weight=1)
+        self._canvas = tk.Canvas(canvas_panel, background="#17191d", cursor="crosshair", highlightthickness=0)
         self._canvas.grid(row=0, column=0, sticky="nsew")
         self._canvas.bind("<Button-1>", self._on_click)
         self._canvas.bind("<Button-3>", self._on_right_click)
-        self._canvas.bind("<Configure>", self._on_configure)
+        self._canvas.bind("<ButtonPress-2>", self._on_pan_start)
+        self._canvas.bind("<B2-Motion>", self._on_pan_motion)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Right: control panel
-        self.control_frame = ttk.LabelFrame(self.root, text="Controls")
-        self.control_frame.grid(row=0, column=1, sticky="ns", padx=5, pady=5)
-        self.control_frame.grid_rowconfigure(0, weight=1)
+        controls = ttk.Frame(body, width=300)
+        controls.grid(row=0, column=1, sticky="ns")
+        controls.grid_propagate(False)
 
-        # ── Image navigation ──────────────────────────────────────────────
-        nav_label = ttk.Label(self.control_frame, text="Image Navigation")
-        nav_label.pack(anchor="w", padx=5, pady=2)
+        ttk.Label(controls, text="Dataset").pack(anchor="w", pady=(0, 3))
+        ttk.Button(controls, text="Open dataset folder…", command=self._open_dataset_directory).pack(fill="x")
+        ttk.Button(controls, text="Open one image…", command=self._open_single_image).pack(fill="x", pady=(3, 8))
 
-        self._image_index_var = tk.StringVar(value="---")
-        ttk.Label(self.control_frame, text="Image:").pack(anchor="w", padx=5)
-        self._image_label = ttk.Label(
-            self.control_frame, text="No dataset loaded", foreground="gray"
-        )
-        self._image_label.pack(anchor="w", padx=5)
+        ttk.Label(controls, textvariable=self._counter_var).pack(anchor="w")
+        ttk.Label(controls, text="Current image:", foreground="gray").pack(anchor="w")
+        self._image_label = ttk.Label(controls, text="No image loaded", wraplength=280)
+        self._image_label.pack(anchor="w", pady=(0, 4))
+        navigation = ttk.Frame(controls)
+        navigation.pack(fill="x")
+        ttk.Button(navigation, text="◀ Previous", command=self._prev_image).pack(side="left", expand=True, fill="x")
+        ttk.Button(navigation, text="Next ▶", command=self._next_image).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        ttk.Button(self.control_frame, text="<< Prev", command=self._prev_image).pack(
-            fill=tk.X, padx=5, pady=2
-        )
-        ttk.Button(self.control_frame, text="Next >>", command=self._next_image).pack(
-            fill=tk.X, padx=5, pady=2
-        )
+        ttk.Separator(controls).pack(fill="x", pady=8)
+        ttk.Label(controls, text="Eye side").pack(anchor="w")
+        ttk.Combobox(controls, textvariable=self._eye_var, values=("OD", "OS"), state="readonly").pack(fill="x")
 
-        # ── Eye side selection ──────────────────────────────────────────
-        eye_label = ttk.Label(self.control_frame, text="Eye Side")
-        eye_label.pack(anchor="w", padx=5, pady=(10, 0))
-        self._eye_var = tk.StringVar(value="OD")
-        for eye in ["OD", "OS"]:
+        ttk.Label(controls, text="Image type").pack(anchor="w", pady=(7, 0))
+        ttk.Combobox(
+            controls, textvariable=self._image_type_var,
+            values=tuple(item.value for item in PentacamImageType), state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(controls, text="Manual image quality").pack(anchor="w", pady=(7, 0))
+        ttk.Combobox(
+            controls, textvariable=self._quality_var,
+            values=tuple(item.value for item in PentacamQuality), state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(controls, text="Annotator ID (optional)").pack(anchor="w", pady=(7, 0))
+        ttk.Entry(controls, textvariable=self._annotator_var).pack(fill="x")
+
+        ttk.Separator(controls).pack(fill="x", pady=8)
+        ttk.Label(controls, text="Annotation structure").pack(anchor="w")
+        for mode, label in (("pupil", "Pupil"), ("limbus", "Limbus"), ("ring", "Suction ring")):
             ttk.Radiobutton(
-                self.control_frame, text=eye, variable=self._eye_var, value=eye
-            ).pack(anchor="w", padx=5, pady=1)
+                controls, text=label, variable=self._mode_var, value=mode,
+                command=self._on_mode_changed,
+            ).pack(anchor="w")
 
-        # ── Image-type classification ───────────────────────────────────
-        it_label = ttk.Label(self.control_frame, text="Image Type")
-        it_label.pack(anchor="w", padx=5, pady=(10, 0))
-        self._image_type_var = tk.StringVar(value="UNKNOWN")
-        for pit in PentacamImageType:
-            ttk.Radiobutton(
-                self.control_frame,
-                text=pit.value,
-                variable=self._image_type_var,
-                value=pit.value,
-            ).pack(anchor="w", padx=5, pady=1)
+        actions = ttk.LabelFrame(controls, text="Annotation")
+        actions.pack(fill="x", pady=8)
+        ttk.Button(actions, text="Fit ellipse (≥5 points)", command=self._fit_ellipse).pack(fill="x", padx=5, pady=2)
+        ttk.Button(actions, text="Undo last point", command=self._undo_point).pack(fill="x", padx=5, pady=2)
+        ttk.Button(actions, text="Clear current structure", command=self._clear_current).pack(fill="x", padx=5, pady=2)
+        ttk.Button(actions, text="Save annotation", command=self._save_annotation).pack(fill="x", padx=5, pady=2)
 
-        # ── Quality grading ─────────────────────────────────────────────
-        ql_label = ttk.Label(self.control_frame, text="Quality Grade")
-        ql_label.pack(anchor="w", padx=5, pady=(10, 0))
-        self._quality_var = tk.StringVar(value="NO_DETECTION")
-        for q in PentacamQuality:
-            ttk.Radiobutton(
-                self.control_frame, text=q.value, variable=self._quality_var, value=q.value
-            ).pack(anchor="w", padx=5, pady=1)
-
-        # ── Orientation ──────────────────────────────────────────────────
-        orient_label = ttk.Label(self.control_frame, text="Orientation")
-        orient_label.pack(anchor="w", padx=5, pady=(10, 0))
-        self._orientation_var = tk.StringVar(value="0°")
+        orientation = ttk.LabelFrame(controls, text="Display orientation")
+        orientation.pack(fill="x", pady=(0, 8))
         ttk.Radiobutton(
-            self.control_frame, text="0° (normal)", variable=self._orientation_var, value="0°"
-        ).pack(anchor="w", padx=5, pady=1)
+            orientation, text="Original (0°)", variable=self._orientation_var,
+            value="0", command=self._on_orientation_changed,
+        ).pack(anchor="w", padx=5)
         ttk.Radiobutton(
-            self.control_frame, text="180° (flipped)", variable=self._orientation_var, value="180°"
-        ).pack(anchor="w", padx=5, pady=1)
+            orientation, text="Rotate display 180°", variable=self._orientation_var,
+            value="180", command=self._on_orientation_changed,
+        ).pack(anchor="w", padx=5)
 
-        # ── Annotation mode ─────────────────────────────────────────────
-        mode_label = ttk.Label(self.control_frame, text="Annotation Mode")
-        mode_label.pack(anchor="w", padx=5, pady=(10, 0))
-        self._mode_var = tk.StringVar(value="pupil")
-        for mode, color in [("pupil", "green"), ("limbus", "blue"), ("ring", "red")]:
-            ttk.Radiobutton(
-                self.control_frame, text=mode.capitalize(),
-                variable=self._mode_var, value=mode,
-            ).pack(anchor="w", padx=5, pady=1)
+        zoom = ttk.Frame(controls)
+        zoom.pack(fill="x", pady=(0, 8))
+        ttk.Button(zoom, text="− Zoom", command=lambda: self._set_zoom(self._zoom / 1.2)).pack(side="left", expand=True, fill="x")
+        ttk.Button(zoom, text="Fit", command=lambda: self._set_zoom(1.0, reset_pan=True)).pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Button(zoom, text="+ Zoom", command=lambda: self._set_zoom(self._zoom * 1.2)).pack(side="left", expand=True, fill="x")
 
-        # ── Action buttons ──────────────────────────────────────────────
-        btn_frame = ttk.LabelFrame(self.control_frame, text="Actions")
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        exports = ttk.LabelFrame(controls, text="Export (local files)")
+        exports.pack(fill="x", pady=(0, 8))
+        ttk.Button(exports, text="Export JSON…", command=self._export_json).pack(fill="x", padx=5, pady=2)
+        ttk.Button(exports, text="Export overlay PNG…", command=self._export_overlay).pack(fill="x", padx=5, pady=2)
+        ttk.Button(exports, text="Export segmentation mask…", command=self._export_mask).pack(fill="x", padx=5, pady=2)
 
-        ttk.Button(btn_frame, text="Add Points", command=self._add_points).pack(
-            fill=tk.X, padx=5, pady=2
-        )
-        ttk.Button(btn_frame, text="Fit Ellipse", command=self._fit_ellipse).pack(
-            fill=tk.X, padx=5, pady=2
-        )
-        ttk.Button(btn_frame, text="Undo Point", command=self._undo_point).pack(
-            fill=tk.X, padx=5, pady=2
-        )
-        ttk.Button(btn_frame, text="Reset Annotation", command=self._reset_annotation).pack(
-            fill=tk.X, padx=5, pady=2
+        ttk.Label(
+            controls,
+            text="Left click: add point  |  Right click: undo\nMiddle-drag: pan  |  Mouse wheel: zoom\nOriginal images are never modified.",
+            wraplength=285, foreground="gray",
+        ).pack(anchor="w", pady=(3, 8))
+
+        ttk.Label(self.root, textvariable=self._status_var, anchor="w", relief="sunken").grid(
+            row=1, column=0, sticky="ew"
         )
 
-        # ── Status ──────────────────────────────────────────────────────
-        self._status_var = tk.StringVar(value="Load a Pentacam image to begin")
-        ttk.Label(self.control_frame, textvariable=self._status_var, font=("Consolas", 9))\
-            .pack(anchor="w", padx=5, pady=5)
-
-        # ── Menu bar ────────────────────────────────────────────────────
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(
-            label="Open Dataset Directory...",
-            command=self._open_dataset_directory
-        )
-        file_menu.add_command(
-            label="Open Single Image...",
-            command=self._open_single_image
-        )
-        file_menu.add_separator()
-        file_menu.add_command(label="Save Annotation", command=self._save_annotation)
-        file_menu.add_command(
-            label="Save Annotation As...",
-            command=self._save_annotation_as
-        )
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
-
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self._show_about)
-
-    # ── Dataset Browser (Phase 2) ────────────────────────────────────────
-
-    def _load_dataset_dir(self, dataset_dir: Path) -> None:
-        """Load a directory of Pentacam images."""
-        # Supported raster formats initially
-        raster_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
-
-        self._image_files = []
-        for p in sorted(dataset_dir.rglob("*")):
-            if p.is_file() and p.suffix.lower() in raster_exts:
-                self._image_files.append(p)
-
-        self._image_index = 0
-        self._annotations_by_image = {}
-        self._load_existing_annotations_for_dataset()
-        self._refresh_image_display()
-
+    # --------------------------- Dataset --------------------------------
     def _open_dataset_directory(self) -> None:
-        """Phase 2: Browse and select a dataset directory."""
-        path = filedialog.askdirectory(
-            title="Select Pentacam Dataset Directory",
-            initialdir=self.dataset_dir,
+        selected = filedialog.askdirectory(
+            title="Select Pentacam dataset directory",
+            initialdir=str(self.dataset_dir) if self.dataset_dir else str(Path.cwd()),
         )
-        if path:
-            self.dataset_dir = Path(path)
-            self._load_dataset_dir(self.dataset_dir)
-            self._status_var.set(
-                f"Loaded dataset: {len(self._image_files)} images"
-            )
+        if selected:
+            self._load_dataset_dir(Path(selected))
 
     def _open_single_image(self) -> None:
-        """Open a single image file (bypass dataset browser)."""
-        path = filedialog.askopenfilename(
-            title="Open Pentacam Image",
-            filetypes=[
-                ("Pentacam images", "*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.dcm *.pdf"),
-                ("All files", "*.*"),
-            ],
+        selected = filedialog.askopenfilename(
+            title="Open Pentacam raster image",
+            filetypes=[("Supported images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff")],
         )
-        if path:
-            p = Path(path)
-            self.dataset_dir = p.parent
-            self._image_files = [p]
-            self._image_index = 0
-            self._annotations_by_image = {}
-            self._load_existing_annotations_for_dataset()
-            self._refresh_image_display()
-            self._status_var.set(f"Opened: {p.name}")
+        if selected:
+            path = Path(selected).resolve()
+            self.dataset_dir = path.parent
+            self._image_files = [path]
+            self._image_index = -1
+            self._load_image(0)
 
-    def _load_existing_annotations_for_dataset(self) -> None:
-        """Load any existing annotations for the current dataset images."""
-        if self._image_files is None:
+    def _load_dataset_dir(self, dataset_dir: Path) -> None:
+        try:
+            images = discover_images(dataset_dir)
+        except (OSError, NotADirectoryError) as exc:
+            messagebox.showerror("Dataset error", str(exc))
+            return
+        self.dataset_dir = dataset_dir.expanduser().resolve()
+        self._image_files = images
+        self._image_index = -1
+        if not images:
+            self._clear_current_image()
+            self._status_var.set("No supported raster images found (JPG, PNG, BMP, TIFF). DICOM/PDF import is not implemented.")
+            return
+        self._load_image(0)
+
+    def _clear_current_image(self) -> None:
+        self.current_image_path = None
+        self.image_id = None
+        self.original_image = None
+        self.display_image = None
+        self._points = {mode: [] for mode in ANNOTATION_MODES}
+        self._ellipses = {mode: None for mode in ANNOTATION_MODES}
+        self._canvas.delete("all")
+        self._image_label.config(text="No image loaded")
+        self._counter_var.set(f"0 / {len(self._image_files)} images")
+
+    def _load_image(self, index: int) -> None:
+        if not self._image_files or not (0 <= index < len(self._image_files)):
+            return
+        if self.current_image_path is not None and self._dirty:
+            self._flush_autosave()
+
+        image_path = self._image_files[index]
+        try:
+            encoded = np.fromfile(str(image_path), dtype=np.uint8)
+            image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+            if image is None:
+                raise ValueError("OpenCV could not decode this file")
+            if image.ndim == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            elif image.ndim == 3 and image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            elif image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError(f"Unsupported image shape: {image.shape}")
+        except (OSError, ValueError, cv2.error) as exc:
+            messagebox.showerror("Image load error", f"Could not load {image_path.name}: {exc}")
             return
 
-        # Load annotations from the workspace's private data directory
-        # (not from the images themselves, to keep images git-ignored)
-        data_dir = Path(".pentacam_annotations")
-        data_dir.mkdir(exist_ok=True)
+        self.current_image_path = image_path
+        self._image_index = index
+        self.original_image = image
+        self.display_image = image.copy()
+        self._orientation_degrees = 0
+        self._orientation_var.set("0")
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._undo_stack.clear()
+        self._points = {mode: [] for mode in ANNOTATION_MODES}
+        self._ellipses = {mode: None for mode in ANNOTATION_MODES}
 
-        for img_path in self._image_files:
-            ann_path = data_dir / f"{img_path.stem}.json"
-            if ann_path.exists():
-                try:
-                    with open(ann_path) as f:
-                        self._annotations_by_image[img_path.name] = json.load(f)
-                except Exception:
-                    self._annotations_by_image[img_path.name] = {}
+        if self.dataset_dir:
+            try:
+                relative_path = image_path.relative_to(self.dataset_dir).as_posix()
+            except ValueError:
+                relative_path = image_path.name
+        else:
+            relative_path = image_path.name
+        self.image_id = stable_image_id(relative_path)
+        self._annotation_path = self.annotation_dir / f"{self.image_id}.json"
+        self._loaded_document = None
+        self._dirty = False
+        self._restore_saved_annotation()
 
-    # ── Annotation Canvas (Phase 3) ─────────────────────────────────────
+        height, width = image.shape[:2]
+        self._image_label.config(text=f"{image_path.name}\n{width} × {height}")
+        self._counter_var.set(f"{index + 1} / {len(self._image_files)} images")
+        self._status_var.set(f"Loaded {image_path.name}; coordinates are stored in original image space")
+        self._refresh_canvas()
 
-    def _add_points(self) -> None:
-        """Add a point in the current annotation mode."""
-        if self._image is None:
+    def _restore_saved_annotation(self) -> None:
+        if self._annotation_path is None or not self._annotation_path.exists():
+            self._loaded_document = None
+            self._eye_var.set("OD")
+            self._image_type_var.set(PentacamImageType.UNKNOWN.value)
+            self._quality_var.set(PentacamQuality.NO_DETECTION.value)
             return
+        try:
+            document = load_annotation_json(self._annotation_path)
+            if document.get("image_id") != self.image_id:
+                raise AnnotationValidationError("saved annotation image_id does not match the selected image")
+            self._loaded_document = document
+            self._loading_metadata = True
+            self._eye_var.set(document.get("eye_side", "OD"))
+            self._image_type_var.set(document.get("image_type", PentacamImageType.UNKNOWN.value))
+            self._quality_var.set(document.get("quality_grade", PentacamQuality.NO_DETECTION.value))
+            self._annotator_var.set(document.get("annotator_id", ""))
+            orientation = document.get("orientation_transform", {})
+            degrees = int(orientation.get("display_rotation_degrees", 0)) if isinstance(orientation, dict) else 0
+            self._orientation_degrees = 180 if degrees == 180 else 0
+            self._orientation_var.set(str(self._orientation_degrees))
+            for mode in ANNOTATION_MODES:
+                record = document.get("annotations", {}).get(mode, {})
+                self._points[mode] = [tuple(point) for point in record.get("boundary_points", [])]
+                self._ellipses[mode] = copy.deepcopy(record.get("ellipse"))
+            self._loading_metadata = False
+            self._dirty = False
+            self._status_var.set("Restored saved annotation")
+        except (OSError, ValueError, json.JSONDecodeError, AnnotationValidationError) as exc:
+            self._loading_metadata = False
+            self._loaded_document = None
+            self._status_var.set(f"Saved annotation could not be loaded: {exc}")
+        self._refresh_canvas()
 
-        mode = self._mode_var.get()
-        self._status_var.set(
-            f"{mode}: Click on the image to add a point (current: {len(self._get_current_points())})"
+    # ------------------------- Coordinate/UI ---------------------------
+    def _on_click(self, event: tk.Event) -> None:
+        if self.original_image is None:
+            return
+        display_x = (event.x - self._offset_x) / self._scale
+        display_y = (event.y - self._offset_y) / self._scale
+        height, width = self.original_image.shape[:2]
+        if not (0 <= display_x < width and 0 <= display_y < height):
+            return
+        original_point = transform_point(
+            (display_x, display_y), width, height, self._orientation_degrees, to_display=False
         )
-
-    def _on_click(self, event) -> None:
-        """Handle canvas clicks for point placement."""
-        if self._image is None:
+        try:
+            validate_points([original_point], width, height)
+        except AnnotationValidationError:
             return
+        self._push_undo()
+        self._points[self._mode].append(original_point)
+        self._mark_dirty()
+        self._status_var.set(f"{self._mode}: {len(self._points[self._mode])} boundary points")
+        self._refresh_canvas()
 
-        # Convert canvas coords to image coords
-        ix = (event.x - self._offset_x) / self._scale
-        iy = (event.y - self._offset_y) / self._scale
-
-        h, w = self._image.shape[:2]
-        if ix < 0 or iy < 0 or ix >= w or iy >= h:
-            return
-
-        mode = self._mode_var.get()
-        if mode == "pupil":
-            self._pupil_points.append((ix, iy))
-        elif mode == "limbus":
-            self._limbus_points.append((ix, iy))
-        elif mode == "ring":
-            self._ring_points.append((ix, iy))
-
-        n = len(self._get_current_points())
-        self._status_var.set(
-            f"{mode}: {n} points (need >= 5 for ellipse fit)"
-        )
-        self._refresh()
-
-    def _on_right_click(self, event) -> None:
-        """Handle right-click: undo point."""
+    def _on_right_click(self, _event: tk.Event) -> None:
         self._undo_point()
 
-    def _undo_point(self) -> None:
-        """Remove the last point from the current mode."""
-        mode = self._mode_var.get()
-        pts = self._get_current_points()
-        if pts:
-            pts.pop()
-        self._refresh()
-        self._status_var.set(
-            f"{mode}: {len(self._get_current_points())} points"
+    def _on_mode_changed(self) -> None:
+        self._mode = self._mode_var.get()
+        self._status_var.set(f"Annotation mode: {self._mode}")
+
+    def _on_metadata_changed(self, *_args: Any) -> None:
+        if not self._loading_metadata and self.original_image is not None:
+            self._mark_dirty()
+
+    def _on_orientation_changed(self) -> None:
+        self._apply_orientation_to_display(int(self._orientation_var.get()))
+
+    def _apply_orientation_to_display(self, degrees: int) -> None:
+        if degrees not in (0, 180):
+            raise ValueError("only 0- and 180-degree orientation is supported")
+        self._orientation_degrees = degrees
+        if self.original_image is not None:
+            self.display_image = (
+                cv2.flip(self.original_image, -1) if degrees == 180 else self.original_image.copy()
+            )
+        self._mark_dirty()
+        self._refresh_canvas()
+
+    def _on_canvas_configure(self, _event: tk.Event) -> None:
+        self._refresh_canvas()
+
+    def _refresh_canvas(self) -> None:
+        if self.original_image is None:
+            return
+        canvas_width = max(1, self._canvas.winfo_width())
+        canvas_height = max(1, self._canvas.winfo_height())
+        height, width = self.original_image.shape[:2]
+        base_scale = min(canvas_width / width, canvas_height / height)
+        self._scale = max(0.01, min(base_scale * self._zoom, 8.0))
+        scaled_width = max(1, int(round(width * self._scale)))
+        scaled_height = max(1, int(round(height * self._scale)))
+        self._offset_x = (canvas_width - scaled_width) / 2 + self._pan_x
+        self._offset_y = (canvas_height - scaled_height) / 2 + self._pan_y
+
+        display = (
+            cv2.flip(self.original_image, -1)
+            if self._orientation_degrees == 180
+            else self.original_image.copy()
         )
+        for mode in ANNOTATION_MODES:
+            color = MODE_COLORS[mode]
+            displayed_points = [
+                transform_point(point, width, height, self._orientation_degrees)
+                for point in self._points[mode]
+            ]
+            for x, y in displayed_points:
+                cv2.circle(display, (int(round(x)), int(round(y))), 3, color, -1)
+            ellipse = self._ellipses[mode]
+            if ellipse:
+                center = transform_point(
+                    (ellipse["center_x"], ellipse["center_y"]),
+                    width, height, self._orientation_degrees,
+                )
+                axes = (
+                    max(1, int(round(ellipse["semi_major"]))),
+                    max(1, int(round(ellipse["semi_minor"]))),
+                )
+                cv2.ellipse(
+                    display, (int(round(center[0])), int(round(center[1]))),
+                    axes, float(ellipse["angle_deg"]), 0, 360, color, 2,
+                )
 
-    def _clear_current(self) -> None:
-        """Clear all points from the current mode."""
-        mode = self._mode_var.get()
-        pts = self._get_current_points()
-        pts.clear()
-        self._refresh()
-        self._status_var.set(f"{mode}: 0 points")
-
-    def _fit_ellipse(self) -> None:
-        """Fit ellipse to the current mode's points."""
-        pts = self._get_current_points()
-        mode = self._mode_var.get()
-
-        if len(pts) < 5:
-            messagebox.showinfo(
-                "Not enough points",
-                f"Need >= 5 points to fit ellipse, got {len(pts)}"
-            )
-            return
-
-        pts_np = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
-        try:
-            ellipse = cv2.fitEllipse(pts_np)
-            (cx, cy), (d1, d2), angle = ellipse
-            sa = max(d1, d2) / 2
-            sb = min(d1, d2) / 2
-            if d2 > d1:
-                angle = (angle + 90) % 180
-
-            # Store the fitted ellipse in the annotation result
-            self._status_var.set(
-                f"{mode}: center=({cx:.1f},{cy:.1f}) axes=({sa:.1f},{sb:.1f}) angle={angle:.1f}"
-            )
-
-            # Refresh display with overlay
-            self._draw_ellipse_overlay(mode, (cx, cy), (sa, sb), angle)
-
-        except cv2.error as e:
-            messagebox.showerror("Fit Error", str(e))
-
-    def _draw_ellipse_overlay(self, mode: str, center: Tuple[float, float], 
-                              axes: Tuple[float, float], angle: float) -> None:
-        """Draw the fitted ellipse on the canvas display."""
-        if self._image is None:
-            return
-
-        # Draw on the display image
-        colors = {
-            "pupil": (0, 255, 0),
-            "limbus": (255, 100, 0),
-            "ring": (0, 0, 255),
-        }
-        color = colors.get(mode, (255, 255, 255))
-
-        # Draw the ellipse
-        cv2.ellipse(self.display_image, 
-                    (int(center[0]), int(center[1])), 
-                    (int(axes[0]), int(axes[1])), 
-                    angle, 0, 360, color, 2)
-
-        # Draw center point
-        cx, cy = center
-        cv2.circle(self.display_image, (int(cx), int(cy)), 4, color, -1)
-
-        # Refresh canvas
-        self._refresh_from_display()
-
-    def _refresh_from_display(self) -> None:
-        """Refresh the canvas from the current display image."""
-        if self._image is None or self.display_image is None:
-            return
-
-        canvas_w = self._canvas.winfo_width()
-        canvas_h = self._canvas.winfo_height()
-        if canvas_w < 10 or canvas_h < 10:
-            return
-
-        # Scale display image to canvas
-        self._scale = min(canvas_w / self.display_image.shape[1], 
-                         canvas_h / self.display_image.shape[0], 1.0)
-        new_w = int(self.display_image.shape[1] * self._scale)
-        new_h = int(self.display_image.shape[0] * self._scale)
-        self._offset_x = (canvas_w - new_w) // 2
-        self._offset_y = (canvas_h - new_h) // 2
-
-        # Resize and convert
-        resized = cv2.resize(self.display_image, (new_w, new_h))
+        self.display_image = display
+        resized = cv2.resize(display, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA if self._scale < 1 else cv2.INTER_CUBIC)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb)
-        self._display_image_tk = ImageTk.PhotoImage(pil_img)
-
+        self._photo_image = ImageTk.PhotoImage(Image.fromarray(rgb))
         self._canvas.delete("all")
         self._canvas.create_image(
-            self._offset_x, self._offset_y,
-            anchor=tk.NW, image=self._display_image_tk,
+            self._offset_x, self._offset_y, anchor=tk.NW, image=self._photo_image
         )
 
-    def _reset_annotation(self) -> None:
-        """Reset all points for the current mode."""
-        self._clear_current()
+    def _set_zoom(self, value: float, reset_pan: bool = False) -> None:
+        self._zoom = max(0.25, min(float(value), 6.0))
+        if reset_pan:
+            self._pan_x = self._pan_y = 0.0
+        self._refresh_canvas()
 
-    # ── Image Orientation (Phase 4) ──────────────────────────────────────
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self._set_zoom(self._zoom * (1.15 if delta > 0 else 1 / 1.15))
 
-    def _apply_orientation_to_display(self, degrees: float) -> None:
-        """Apply orientation transform to the display image.
+    def _on_pan_start(self, event: tk.Event) -> None:
+        self._pan_anchor = (event.x, event.y)
 
-        The original image is never modified. This updates display_image.
-        """
-        if degrees == 0 or self.original_image is None:
-            self.display_image = self.original_image.copy() if self.original_image is not None else None
+    def _on_pan_motion(self, event: tk.Event) -> None:
+        if self._pan_anchor is None:
             return
+        previous_x, previous_y = self._pan_anchor
+        self._pan_x += event.x - previous_x
+        self._pan_y += event.y - previous_y
+        self._pan_anchor = (event.x, event.y)
+        self._refresh_canvas()
 
-        if degrees == 180 and self.original_image is not None:
-            self.display_image = cv2.flip(self.original_image, -1)
-            self._orientation_degrees = 180.0
-            self._orientation_applied = True
+    # -------------------------- Annotation -----------------------------
+    def _push_undo(self) -> None:
+        self._undo_stack.append((copy.deepcopy(self._points), copy.deepcopy(self._ellipses)))
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+
+    def _undo_point(self) -> None:
+        if not self._undo_stack:
+            if self._points[self._mode]:
+                self._push_undo()
+                self._points[self._mode].pop()
+                self._mark_dirty()
         else:
-            self.display_image = self.original_image.copy()
-            self._orientation_degrees = 0.0
-            self._orientation_applied = False
+            self._points, self._ellipses = self._undo_stack.pop()
+            self._mark_dirty()
+        self._refresh_canvas()
 
-        self._refresh_from_display()
-
-    def _original_image_is_valid(self) -> bool:
-        return self._original_image is not None
-
-    # ── Annotation Metadata (Phase 5) ───────────────────────────────────
-
-    def _build_annotation_result(self) -> PentacamDetectionResult:
-        """Build the PentacamDetectionResult from current UI state."""
-        if self.annotation_result is None:
-            self.annotation_result = PentacamDetectionResult()
-
-        # Map UI state to result
-        self.annotation_result.valid = len(self._get_current_points()) >= 5
-        self.annotation_result.status = PentacamDetectionStatus.OK
-
-        # Image type
-        try:
-            self.annotation_result.image_type = PentacamImageType(
-                self._image_type_var.get()
-            )
-        except ValueError:
-            self.annotation_result.image_type = PentacamImageType.UNKNOWN
-
-        # Quality grade
-        try:
-            self.annotation_result.quality = PentacamQuality(
-                self._quality_var.get()
-            )
-        except ValueError:
-            self.annotation_result.quality = PentacamQuality.NO_DETECTION
-
-        # Detection status
-        self.annotation_result.status = PentacamDetectionStatus.OK
-
-        # Pupil ellipse - from clicked points
-        pupil_pts = self._pupil_points
-        if len(pupil_pts) >= 5:
-            pts_np = np.array(pupil_pts, dtype=np.float32).reshape(-1, 1, 2)
-            try:
-                ellipse = cv2.fitEllipse(pts_np)
-                (cx, cy), (d1, d2), angle = ellipse
-                sa = max(d1, d2) / 2
-                sb = min(d1, d2) / 2
-                if d2 > d1:
-                    angle = (angle + 90) % 180
-                
-                self.annotation_result.geometry.pupil_detected = True
-                self.annotation_result.geometry.pupil_radius_px = sa
-            except cv2.error:
-                pass
-
-        # Limbus ellipse - from clicked points
-        limbus_pts = self._limbus_points
-        if len(limbus_pts) >= 5:
-            pts_np = np.array(limbus_pts, dtype=np.float32).reshape(-1, 1, 2)
-            try:
-                ellipse = cv2.fitEllipse(pts_np)
-                (cx, cy), (d1, d2), angle = ellipse
-                sa = max(d1, d2) / 2
-                sb = min(d1, d2) / 2
-                if d2 > d1:
-                    angle = (angle + 90) % 180
-                
-                self.annotation_result.geometry.limbus_detected = True
-                self.annotation_result.geometry.limbus_radius_px = sa
-            except cv2.error:
-                pass
-
-        # Boundary points (raw clicked points stored as feature set)
-        features = []
-        for i, (x, y) in enumerate(self._pupil_points[:36]):
-            features.append({
-                "id": i,
-                "x": float(x),
-                "y": float(y),
-                "confidence": 0.9,
-            })
-        self.annotation_result.feature_set.features = features
-
-        # Annotator ID and timestamp
-        import time
-        self.annotation_result.confidence = 0.9
-        self.annotation_result.processing_time_ms = 0.0
-
-        # Schema version
-        self.annotation_result.annotation_schema_version = WorkspaceAnnotationSchemaVersion.V1_1.value
-
-        # Orientation transform
-        orient_str = f"0°->{int(self._orientation_degrees)}°" if self._orientation_applied else "0°"
-        self.annotation_result.orientation_transform = orient_str
-
-        return self.annotation_result
-
-    # ── Annotation Persistence (Phase 6) ────────────────────────────────
-
-    def _save_annotation(self) -> None:
-        """Save the current annotation."""
-        if self._image is None:
-            messagebox.showinfo("No Image", "Load an image first")
+    def _clear_current(self) -> None:
+        if self.original_image is None:
             return
+        self._push_undo()
+        self._points[self._mode] = []
+        self._ellipses[self._mode] = None
+        self._mark_dirty()
+        self._refresh_canvas()
 
-        # Build the annotation result
-        result = self._build_annotation_result()
-
-        # Determine save path
-        if self._annotation_path is None:
-            # Save to private data directory
-            data_dir = Path(".pentacam_annotations")
-            data_dir.mkdir(exist_ok=True)
-            ann_path = data_dir / f"{self.current_image_path.stem}.json"
-        else:
-            ann_path = Path(self._annotation_path)
-
-        # Check if file already exists — don't overwrite without confirmation
-        if ann_path.exists():
-            result_msg = messagebox.askyesno(
-                "Existing Annotation",
-                f"A annotation already exists at {ann_path.name}.\n"
-                "Overwrite?"
-            )
-            if not result_msg:
-                return
-
-        # Serialize the result
+    def _fit_ellipse(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+        height, width = self.original_image.shape[:2]
         try:
-            if hasattr(result, 'to_dict'):
-                result_dict = result.to_dict()
-                if "schema_version" not in result_dict:
-                    result_dict["schema_version"] = WorkspaceAnnotationSchemaVersion.V1_1.value
-            else:
-                result_dict = {
-                    "valid": result.valid,
-                    "status": result.status.value if hasattr(result.status, 'value') else str(result.status),
-                    "image_type": result.image_type.value if hasattr(result.image_type, 'value') else str(result.image_type),
-                    "quality": result.quality.value if hasattr(result.quality, 'value') else str(result.quality),
-                    "geometry": result.geometry.to_dict() if hasattr(result.geometry, 'to_dict') else {},
-                    "feature_set": result.feature_set.to_dict() if hasattr(result.feature_set, 'to_dict') else {},
-                    "image_width": getattr(result, 'image_width', 0),
-                    "image_height": getattr(result, 'image_height', 0),
-                    "confidence": round(result.confidence, 4) if result.confidence else 0.0,
-                    "processing_time_ms": round(result.processing_time_ms, 2) if result.processing_time_ms else 0.0,
-                    "schema_version": result.annotation_schema_version,
-                    "orientation_transform": result.orientation_transform,
-                    "failure_reason": result.failure_reason,
-                    "annotator_id": getattr(result, 'annotator_id', ''),
-                    "annotated_at": getattr(result, 'annotated_at', 0.0),
+            ellipse = fit_ellipse_annotation(self._points[self._mode], width, height)
+        except AnnotationValidationError as exc:
+            messagebox.showwarning("Cannot fit ellipse", str(exc))
+            return
+        self._push_undo()
+        self._ellipses[self._mode] = ellipse
+        self._mark_dirty()
+        self._status_var.set(
+            f"{self._mode}: center=({ellipse['center_x']:.1f}, {ellipse['center_y']:.1f}), "
+            f"axes=({ellipse['semi_major']:.1f}, {ellipse['semi_minor']:.1f}) px"
+        )
+        self._refresh_canvas()
+
+    def _build_annotation_document(self) -> dict[str, Any]:
+        if self.original_image is None or self.current_image_path is None or self.image_id is None:
+            raise AnnotationValidationError("no image is loaded")
+        height, width = self.original_image.shape[:2]
+        annotations: dict[str, Any] = {}
+        for mode in ANNOTATION_MODES:
+            points = validate_points(self._points[mode], width, height)
+            if points or self._ellipses[mode]:
+                annotations[mode] = {
+                    "boundary_points": [[x, y] for x, y in points],
+                    "ellipse": copy.deepcopy(self._ellipses[mode]),
                 }
 
-            with open(ann_path, "w") as f:
-                json.dump(result_dict, f, indent=2)
-
-            self._status_var.set(f"Saved annotation to {ann_path.name}")
-
-            # Track in memory
-            self._annotations_by_image[self.current_image_path.name] = result_dict
-
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save annotation: {e}")
-            logger.error(f"Annotation save error: {e}")
-
-    def _save_annotation_as(self) -> None:
-        """Save annotation to a chosen path."""
-        path = filedialog.asksaveasfilename(
-            title="Save Annotation As",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
+        now = _utc_now()
+        created_at = (
+            self._loaded_document.get("created_at", now)
+            if self._loaded_document else now
         )
-        if path:
-            self._annotation_path = path
-            self._save_annotation()
+        status = (
+            "OK" if self._ellipses["pupil"] and self._ellipses["limbus"]
+            else "NO_PUPIL" if not self._ellipses["pupil"]
+            else "NO_LIMBUS"
+        )
+        document = {
+            "schema_version": SCHEMA_VERSION,
+            "image_id": self.image_id,
+            "image_width": width,
+            "image_height": height,
+            "coordinate_system": "original_image_pixels",
+            "eye_side": self._eye_var.get(),
+            "image_type": self._image_type_var.get(),
+            "quality_grade": self._quality_var.get(),
+            "detection_status": status,
+            "annotations": annotations,
+            "roi_box_norm": None,
+            "failure_reason": "",
+            "annotator_id": self._annotator_var.get().strip(),
+            "created_at": created_at,
+            "updated_at": now,
+            "orientation_transform": {
+                "display_rotation_degrees": self._orientation_degrees,
+                "coordinates_stored_in": "original_image_pixels",
+            },
+        }
+        validate_annotation_document(document)
+        return document
 
-    def _reopen_annotation(self, image_path: Path) -> None:
-        """Re-open a previously saved annotation."""
-        data_dir = Path(".pentacam_annotations")
-        ann_path = data_dir / f"{image_path.stem}.json"
+    def _validate_current(self) -> None:
+        if self.original_image is None:
+            raise AnnotationValidationError("no image is loaded")
+        height, width = self.original_image.shape[:2]
+        for mode in ANNOTATION_MODES:
+            validate_points(self._points[mode], width, height)
+            ellipse = self._ellipses[mode]
+            if ellipse:
+                validate_annotation_document({
+                    "schema_version": SCHEMA_VERSION,
+                    "image_width": width,
+                    "image_height": height,
+                    "annotations": {mode: {"boundary_points": self._points[mode], "ellipse": ellipse}},
+                })
 
-        if ann_path.exists():
-            try:
-                with open(ann_path) as f:
-                    data = json.load(f)
-                self._annotations_by_image[image_path.name] = data
-                if "image_type" in data:
-                    self._image_type_var.set(data["image_type"])
-                if "quality" in data:
-                    self._quality_var.set(data["quality"])
-                if "orientation_transform" in data:
-                    orient = data["orientation_transform"]
-                    if "180°" in orient:
-                        self._orientation_var.set("180°")
-                        self._orientation_applied = True
-                        self._apply_orientation_to_display(180)
-                self._status_var.set(
-                    f"Re-opened annotation from {ann_path.name}"
-                )
-            except Exception as e:
-                messagebox.showerror("Load Error", f"Failed to load annotation: {e}")
-                logger.error(f"Annotation load error: {e}")
-        else:
-            self._annotations_by_image[image_path.name] = {}
-            self._status_var.set("No saved annotation found — starting fresh")
+    # ---------------------- Persistence/autosave ------------------------
+    def _annotation_document_path(self) -> Path:
+        if self._annotation_path is None:
+            raise AnnotationValidationError("annotation path is not initialized")
+        return self._annotation_path
 
-    # ── Quality Control (Phase 7) ───────────────────────────────────────
+    def _write_current_annotation(self) -> Path:
+        document = self._build_annotation_document()
+        path = save_annotation_json(self._annotation_document_path(), document)
+        self._loaded_document = document
+        self._dirty = False
+        return path
 
-    def _validate_annotation(self) -> Tuple[bool, str]:
-        """Validate the current annotation.
-
-        Returns (is_valid, error_message).
-        """
-        if self._image is None:
-            return False, "No image loaded"
-
-        h, w = self._image.shape[:2]
-        for pts in [self._pupil_points, self._limbus_points, self._ring_points]:
-            for (x, y) in pts:
-                if x < 0 or x >= w or y < 0 or y >= h:
-                    return False, f"Point ({x:.1f},{y:.1f}) is outside image bounds ({w}x{h})"
-
-        return True, ""
-
-    # ── Export (Phase 8) ────────────────────────────────────────────────
-
-    def _export_annotations(self) -> None:
-        """Export annotations in versioned JSON format."""
-        if self._image is None:
-            messagebox.showinfo("No Image", "Load an image first")
+    def _mark_dirty(self) -> None:
+        if self.original_image is None:
             return
+        self._dirty = True
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+        self._autosave_job = self.root.after(900, self._autosave)
 
-        result = self._build_annotation_result()
+    def _autosave(self) -> None:
+        self._autosave_job = None
+        if not self._dirty or self.original_image is None:
+            return
+        try:
+            self._write_current_annotation()
+            self._status_var.set("Draft autosaved locally")
+        except (OSError, AnnotationValidationError, TypeError, ValueError) as exc:
+            self._status_var.set(f"Autosave failed: {exc}")
 
+    def _flush_autosave(self) -> None:
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+            self._autosave_job = None
+        if self._dirty and self.original_image is not None:
+            self._autosave()
+
+    def _save_annotation(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+        try:
+            path = self._write_current_annotation()
+            self._status_var.set(f"Saved private annotation: {path.name}")
+        except (OSError, AnnotationValidationError, TypeError, ValueError) as exc:
+            messagebox.showerror("Save error", str(exc))
+
+    def _on_close(self) -> None:
+        self._flush_autosave()
+        self.root.destroy()
+
+    # ------------------------------ Export ------------------------------
+    def _export_json(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
+        try:
+            document = self._build_annotation_document()
+            path = filedialog.asksaveasfilename(
+                title="Export annotation JSON",
+                defaultextension=".json",
+                initialfile=f"{self.image_id}.json",
+                filetypes=[("JSON", "*.json")],
+            )
+            if path:
+                save_annotation_json(path, document)
+                self._status_var.set("Annotation JSON exported")
+        except (OSError, AnnotationValidationError, TypeError, ValueError) as exc:
+            messagebox.showerror("Export error", str(exc))
+
+    @staticmethod
+    def _write_image(path: Path, image: np.ndarray) -> None:
+        suffix = path.suffix.lower() or ".png"
+        success, encoded = cv2.imencode(suffix, image)
+        if not success:
+            raise OSError(f"OpenCV could not encode {suffix}")
+        encoded.tofile(str(path))
+
+    def _render_original_overlay(self) -> np.ndarray:
+        if self.original_image is None:
+            raise AnnotationValidationError("no image is loaded")
+        overlay = self.original_image.copy()
+        for mode in ANNOTATION_MODES:
+            color = MODE_COLORS[mode]
+            for x, y in self._points[mode]:
+                cv2.circle(overlay, (int(round(x)), int(round(y))), 3, color, -1)
+            ellipse = self._ellipses[mode]
+            if ellipse:
+                center = (int(round(ellipse["center_x"])), int(round(ellipse["center_y"])))
+                axes = (max(1, int(round(ellipse["semi_major"]))), max(1, int(round(ellipse["semi_minor"]))))
+                cv2.ellipse(overlay, center, axes, ellipse["angle_deg"], 0, 360, color, 2)
+        return overlay
+
+    def _export_overlay(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
+            return
         path = filedialog.asksaveasfilename(
-            title="Export Annotations",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
+            title="Export original-coordinate overlay",
+            defaultextension=".png",
+            initialfile=f"{self.image_id}_overlay.png",
+            filetypes=[("PNG", "*.png")],
         )
         if not path:
             return
-
         try:
-            if hasattr(result, 'to_dict'):
-                result_dict = result.to_dict()
-                if "schema_version" not in result_dict:
-                    result_dict["schema_version"] = WorkspaceAnnotationSchemaVersion.V1_1.value
-            else:
-                result_dict = {
-                    "schema_version": WorkspaceAnnotationSchemaVersion.V1_1.value,
-                    "valid": result.valid,
-                    "status": result.status.value if hasattr(result.status, 'value') else str(result.status),
-                    "image_type": result.image_type.value if hasattr(result.image_type, 'value') else str(result.image_type),
-                    "quality": result.quality.value if hasattr(result.quality, 'value') else str(result.quality),
-                    "orientation_transform": result.orientation_transform,
-                    "failure_reason": result.failure_reason,
-                    "annotator_id": getattr(result, 'annotator_id', ''),
-                    "annotated_at": getattr(result, 'annotated_at', 0.0),
-                }
+            self._write_image(Path(path), self._render_original_overlay())
+            self._status_var.set("Overlay exported in original image orientation")
+        except OSError as exc:
+            messagebox.showerror("Overlay export error", str(exc))
 
-            with open(path, "w") as f:
-                json.dump(result_dict, f, indent=2)
-
-            self._export_annotated_overlay(path)
-            self._export_mask(path)
-
-            self._status_var.set(f"Exported to {Path(path).name}")
-
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export: {e}")
-            logger.error(f"Export error: {e}")
-
-    def _export_annotated_overlay(self, json_path: Path) -> None:
-        """Generate an annotated image overlay next to the JSON."""
-        if self._image is None or self.display_image is None:
+    def _export_mask(self) -> None:
+        if self.original_image is None:
+            messagebox.showinfo("No image", "Load an image first.")
             return
+        try:
+            document = self._build_annotation_document()
+            mask = build_segmentation_mask(document)
+            path = filedialog.asksaveasfilename(
+                title="Export segmentation mask (class IDs 0–3)",
+                defaultextension=".png",
+                initialfile=f"{self.image_id}_mask.png",
+                filetypes=[("PNG", "*.png")],
+            )
+            if path:
+                self._write_image(Path(path), mask)
+                self._status_var.set("Segmentation mask exported (0=background, 1=pupil, 2=iris, 3=ring outline)")
+        except (OSError, AnnotationValidationError, TypeError, ValueError) as exc:
+            messagebox.showerror("Mask export error", str(exc))
 
-        data_dir = Path(".pentacam_annotations")
-        base_name = Path(json_path).stem
-        overlay_path = data_dir / f"{base_name}_overlay.png"
-
-        disp = self.display_image.copy()
-        colors = {
-            "pupil": (0, 255, 0),
-            "limbus": (255, 100, 0),
-            "ring": (0, 0, 255),
-        }
-
-        for mode, pts, color in [
-            ("pupil", self._pupil_points, colors["pupil"]),
-            ("limbus", self._limbus_points, colors["limbus"]),
-        ]:
-            for (x, y) in pts:
-                cv2.circle(disp, (int(x), int(y)), 3, color, -1)
-
-        for mode, pts, color in [
-            ("pupil", self._pupil_points, colors["pupil"]),
-            ("limbus", self._limbus_points, colors["limbus"]),
-        ]:
-            if len(pts) >= 5:
-                try:
-                    pts_np = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
-                    ellipse = cv2.fitEllipse(pts_np)
-                    cv2.ellipse(disp, ellipse, color, 2)
-                except cv2.error:
-                    pass
-
-        if self._orientation_applied:
-            cv2.putText(disp, "180° flipped", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-        overlay_path = overlay_path.parent / f"{overlay_path.stem}_overlay.png"
-        cv2.imwrite(str(overlay_path), disp)
-        logger.info(f"Exported annotated overlay: {overlay_path}")
-
-    def _export_mask(self, json_path: Path) -> None:
-        """Generate segmentation mask where applicable."""
-        data_dir = Path(".pentacam_annotations")
-        base_name = Path(json_path).stem
-        mask_path = data_dir / f"{base_name}_mask.png"
-        logger.info(f"Mask export noted: {mask_path} (implementation: pupil/limbus binary masks pending)")
-
-    # ── Navigation ───────────────────────────────────────────────────────
-
+    # --------------------------- Navigation -----------------------------
     def _prev_image(self) -> None:
-        if not self._image_files or self._image_index <= 0:
-            return
-        self._image_index -= 1
-        self._load_image(self._image_files[self._image_index])
+        if self._image_index > 0:
+            self._flush_autosave()
+            self._load_image(self._image_index - 1)
 
     def _next_image(self) -> None:
-        if not self._image_files or self._image_index >= len(self._image_files) - 1:
-            return
-        self._image_index += 1
-        self._load_image(self._image_files[self._image_index])
-
-    def _load_image(self, image_path: Path) -> None:
-        """Load a specific image from the dataset."""
-        self.current_image_path = image_path
-
-        try:
-            original = cv2.imread(str(image_path))
-            if original is None:
-                messagebox.showerror("Error", f"Cannot read: {image_path}")
-                return
-
-            self.original_image = original
-            self._orientation_degrees = 0.0
-            self._orientation_applied = False
-            self.display_image = self.original_image.copy()
-
-            self._reopen_annotation(image_path)
-
-            self._image_label.config(
-                text=f"{image_path.name} ({self.original_image.shape[1]}x{self.original_image.shape[0]})"
-            )
-            self._refresh_from_display()
-            self._status_var.set(
-                f"Loaded: {image_path.name} — Use annotation tools above"
-            )
-
-        except Exception as e:
-            messagebox.showerror("Load Error", f"Failed to load image: {e}")
-            logger.error(f"Image load error: {e}")
-
-    # ── Utility methods ─────────────────────────────────────────────────
-
-    def _show_about(self) -> None:
-        msg = (
-            "Pentacam Manual Annotation Workspace\n"
-            "Version 1.0\n\n"
-            "Extension of the existing ellipse-based annotation tool\n"
-            "with Pentacam-specific features:\n"
-            "- Image-type classification (PentacamImageType enum)\n"
-            "- Quality grading (PentacamQuality enum)\n"
-            "- OD/OS eye-side selection\n"
-            "- 180° orientation handling with coordinate transform\n"
-            "- Versioned annotation schema (V1.0/V1.1)\n"
-            "- Annotation persistence in private .pentacam_annotations/ dir\n"
-            "- Export with annotated overlays\n\n"
-            "Dataset remains private; no patient images uploaded."
-        )
-        messagebox.showinfo("About", msg)
-
-    def run(self) -> None:
-        self.root.mainloop()
+        if self._image_index + 1 < len(self._image_files):
+            self._flush_autosave()
+            self._load_image(self._image_index + 1)
 
 
-def launch_pentacam_workspace(dataset_dir: Optional[Path] = None) -> None:
-    """Launch the Pentacam annotation workspace."""
+def launch_pentacam_workspace(
+    dataset_dir: Optional[Path] = None,
+    annotation_dir: Optional[Path] = None,
+) -> None:
+    """Launch the workspace; private annotations default to ./.pentacam_annotations."""
     root = tk.Tk()
-    app = PentacamAnnotationWorkspace(root, dataset_dir=dataset_dir)
-    app.run()
+    PentacamAnnotationWorkspace(root, dataset_dir=dataset_dir, annotation_dir=annotation_dir)
+    root.mainloop()
 
 
 if __name__ == "__main__":
