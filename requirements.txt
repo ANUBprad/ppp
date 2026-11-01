@@ -1,0 +1,76 @@
+# ============================================================================
+# Pupil-Limbus Detector - Complete Project Requirements
+# ============================================================================
+# Install all at once with: pip install -r requirements.txt
+#
+# INFERENCE RUNTIME — choose ONE of the options below:
+#
+#   Option A — CPU only (default, works everywhere):
+#     pip install onnxruntime
+#
+#   Option B — Intel Iris Xe / AMD iGPU / any DirectML GPU on Windows
+#              (recommended for the doctor's Lenovo IdeaPad i5-1135G7):
+#     pip install onnxruntime-directml
+#
+#   Option C — Intel CPU + iGPU together via OpenVINO (highest throughput
+#              on Intel hardware, uses CPU and iGPU simultaneously):
+#     pip install onnxruntime-openvino
+#
+#   Option D — NVIDIA discrete GPU:
+#     pip install onnxruntime-gpu
+#     (also reinstall torch with CUDA: see https://pytorch.org/get-started)
+#
+#   The app auto-detects which runtime is installed and picks the best
+#   available provider. Falling back to CPU if no GPU runtime is found.
+# ============================================================================
+
+# ============================================================================
+# DEEP LEARNING & NEURAL NETWORKS
+# ============================================================================
+torch>=1.12.0                      # PyTorch - Core deep learning framework
+torchvision>=0.13.0                # PyTorch vision models and utilities
+segmentation-models-pytorch>=0.3.0 # Pre-built segmentation architectures (U-Net, etc.)
+onnxruntime>=1.12.0                # ONNX Runtime - ML inference engine (see options above)
+
+# ============================================================================
+# IMAGE & COMPUTER VISION PROCESSING
+# ============================================================================
+opencv-python>=4.6.0               # OpenCV - Image processing and video handling
+Pillow>=9.0.0                      # PIL - Image file I/O and manipulation
+albumentations>=1.3.0              # Advanced image augmentation for training
+scipy>=1.7.0                       # Scientific computing (used by albumentations)
+
+# ============================================================================
+# NUMERICAL & ARRAY COMPUTING
+# ============================================================================
+numpy>=1.21.0                      # NumPy - Numerical array operations
+
+# ============================================================================
+# MACHINE LEARNING UTILITIES
+# ============================================================================
+scikit-learn>=1.0.0                # Scikit-learn - Additional ML algorithms and utilities
+
+# ============================================================================
+# DATA VISUALIZATION
+# ============================================================================
+matplotlib>=3.5.0                  # Matplotlib - Plotting and visualization
+
+# ============================================================================
+# PROGRESS & USER INTERFACE
+# ============================================================================
+tqdm>=4.64.0                       # tqdm - Progress bars for long-running operations
+
+# ============================================================================
+# TESTING FRAMEWORK (Optional but recommended)
+# ============================================================================
+pytest>=6.0.0                      # pytest - Unit testing framework for test suite
+
+# ============================================================================
+# NOTES:
+# - tkinter comes built-in with Python on Windows/macOS/Linux (no pip needed)
+# - Standard library modules (json, csv, pathlib, etc.) are included with Python
+# - onnx is needed only for model export (scripts/export_onnx.py,
+#   scripts/convert_to_onnx.py): pip install onnx
+# - onnxruntime variants (directml, openvino, gpu) replace onnxruntime above
+# ============================================================================
+

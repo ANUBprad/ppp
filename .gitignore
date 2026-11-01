@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Large model files (production ONNX loaded at runtime; models/onnx/ metadata tracked)
+*.pth
+*.pt
+*.onnx
+*.onnx.data
+*.h5
+
+# Logs and audit output
+logs/
+*.log
+audit_*.jsonl
+
+# Generated / temporary files
+runtime_trace.py
+project_tree.txt
+PROJECT_COMPLETE_ANALYSIS.md
+manual_ring_priors.json
+diagnostic_output/
+output/
+
+# Training data (large, not needed for repo)
+clinical_data/training_data/
+
+# Assistant / Claude / Cursor config
+.claude/
+*.csv.xlsx
+
+# Environment / secrets
+.env
+.env.*
+
+# Phase artifacts (temporary work, golden outputs, port scratch) — never commit
+_phase_artifacts/
+
+# .NET / C# build output (scoped to the C# port under csharp/)
+csharp/**/bin/
+csharp/**/obj/
+csharp/**/*.user
+csharp/**/publish/
+.vs/
+
+# Private Pentacam / clinical patient dataset
+/wetransfer_pupil-centration-video-23-10-2026_2026-10-23_1104 (2)/
+/clinical_data/
+
+# Local audit and terminal artifacts
+/tatus --short
+/pytest_summary.txt

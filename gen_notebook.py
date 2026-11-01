@@ -1,0 +1,315 @@
+"""Regenerates train_colab.ipynb with correct line continuations."""
+import json, pathlib
+
+NB_PATH = pathlib.Path(__file__).parent / "train_colab.ipynb"
+
+
+def cell(cell_type, source, **kw):
+    c = {"cell_type": cell_type, "metadata": {}, "source": source}
+    if cell_type == "code":
+        c.update({"execution_count": None, "outputs": []})
+    c["metadata"].update(kw.pop("metadata", {}))
+    c.update(kw)
+    return c
+
+
+cells = [
+    cell("markdown", [
+        "# \U0001f441\ufe0f Pupil-Limbus Segmentation Model Training on Google Colab \U0001f680\n",
+        "\n",
+        "Welcome to the Google Colab training notebook for the Pupil-Limbus eye tracker!  \n",
+        "By using Google Colab's high-performance cloud GPUs (T4, L4, or A100), you can train **up to 20x faster** than on a local CPU.\n",
+        "\n",
+        "### \U0001f4cb Workflow Overview:\n",
+        "1. Verify GPU is active\n",
+        "2. Clone the project code from GitHub *(no ZIP uploads needed)*\n",
+        "3. Upload your `clinical_data.zip` from Google Drive\n",
+        "4. Install dependencies\n",
+        "5. Verify annotations\n",
+        "6. Run training\n",
+        "7. Export ONNX and download your trained model\n",
+    ], metadata={"id": "intro-cell"}),
+
+    cell("code", [
+        "# @title 1. Verify GPU Acceleration \U0001f3ce\ufe0f\n",
+        "import torch\n",
+        "if torch.cuda.is_available():\n",
+        "    d = torch.cuda.get_device_properties(0)\n",
+        "    print(f'\u2705 GPU active: {torch.cuda.get_device_name(0)}')\n",
+        "    print(f'   Total GPU memory: {d.total_memory / (1024**3):.2f} GB')\n",
+        "    print(f'   CUDA version:     {torch.version.cuda}')\n",
+        "else:\n",
+        "    print('\u274c GPU is NOT active!')\n",
+        "    print('   Go to: Runtime -> Change runtime type -> GPU (T4 GPU is free) -> Save')\n",
+        "    print('   Then restart the runtime and run all cells again.')\n",
+    ], metadata={"cellView": "form", "id": "check-gpu"}),
+
+    cell("markdown", [
+        "## 2. Clone Project Code from GitHub \U0001f4e6\n",
+        "\n",
+        "This pulls the **latest committed code** directly from GitHub.  \n",
+        "No ZIP files, no nested folder issues!\n",
+    ], metadata={"id": "section-clone"}),
+
+    cell("code", [
+        "# @title 2. Clone / Update Project from GitHub \U0001f504\n",
+        "import os, shutil\n",
+        "from pathlib import Path\n",
+        "\n",
+        "# CRITICAL: always reset cwd to /content FIRST.\n",
+        "os.chdir('/content')\n",
+        "print(f'Working directory: {os.getcwd()}')\n",
+        "\n",
+        "WORKSPACE = Path('/content/workspace')\n",
+        "REPO_URL  = 'https://github.com/Prince649294u83/Centration.git'\n",
+        "\n",
+        "if WORKSPACE.exists() and (WORKSPACE / '.git').exists():\n",
+        "    print('\U0001f504 Workspace already cloned - pulling latest changes...')\n",
+        "    !git -C /content/workspace pull\n",
+        "    # Clear Python bytecode cache to force reimport\n",
+        "    for d in WORKSPACE.rglob('__pycache__'):\n",
+        "        shutil.rmtree(d)\n",
+        "        print(f'   Cleared cache: {d}')\n",
+        "else:\n",
+        "    if WORKSPACE.exists():\n",
+        "        shutil.rmtree(WORKSPACE)\n",
+        "    print(f'\U0001f4e5 Cloning from {REPO_URL} ...')\n",
+        "    !git clone https://github.com/Prince649294u83/Centration.git /content/workspace\n",
+        "\n",
+        "# Verify critical files exist\n",
+        "print('\\n\U0001f4c2 Verifying project structure...')\n",
+        "ok = True\n",
+        "for f in ['scripts/train_model.py', 'scripts/export_onnx.py', 'pupil_tracking']:\n",
+        "    path = WORKSPACE / f\n",
+        "    if path.exists():\n",
+        "        print(f'   \u2705 {f}')\n",
+        "    else:\n",
+        "        print(f'   \u274c MISSING: {f}')\n",
+        "        ok = False\n",
+        "\n",
+        "if ok:\n",
+        "    print('\\n\u2705 Project code is ready!')\n",
+        "else:\n",
+        "    print('\\n\u274c Some files are missing. Check the repository URL and try again.')\n",
+    ], metadata={"id": "clone-repo"}),
+
+    cell("markdown", [
+        "## 3. Connect Your Clinical Data \U0001f4c1\n",
+        "\n",
+        "Choose **one** option:\n",
+        "- **Option A** *(Recommended)*: Mount Google Drive\n",
+        "- **Option B**: Upload directly to Colab\n",
+    ], metadata={"id": "section-data"}),
+
+    cell("code", [
+        "# @title Option A: Mount Google Drive & Copy Clinical Data \U0001f4c1 (Recommended)\n",
+        "from google.colab import drive\n",
+        "import shutil\n",
+        "from pathlib import Path\n",
+        "\n",
+        "try:\n",
+        "    drive.mount('/content/drive')\n",
+        "    print('\u2705 Google Drive mounted!')\n",
+        "    drive_zip = Path('/content/drive/MyDrive/clinical_data.zip')\n",
+        "    local_zip = Path('/content/clinical_data.zip')\n",
+        "    if drive_zip.exists():\n",
+        "        shutil.copy2(drive_zip, local_zip)\n",
+        "        mb = local_zip.stat().st_size / 1024 / 1024\n",
+        "        print(f'   \u2705 Copied! ({mb:.1f} MB)')\n",
+        "    else:\n",
+        "        print('   \u2139\ufe0f  clinical_data.zip not found in Drive root.')\n",
+        "except Exception as e:\n",
+        "    print(f'\u26a0\ufe0f  Drive mount failed: {e}')\n",
+    ], metadata={"id": "mount-drive"}),
+
+    cell("code", [
+        "# @title Option B: Upload clinical_data.zip Directly \U0001f4e4\n",
+        "from google.colab import files\n",
+        "print('\U0001f4e4 Select your clinical_data.zip file...')\n",
+        "uploaded = files.upload()\n",
+        "for name, data in uploaded.items():\n",
+        "    dest = f'/content/{name}'\n",
+        "    with open(dest, 'wb') as f:\n",
+        "        f.write(data)\n",
+        "    mb = len(data) / 1024 / 1024\n",
+        "    print(f'   \u2705 Uploaded: {dest} ({mb:.1f} MB)')\n",
+    ], metadata={"id": "upload-direct"}),
+
+    cell("code", [
+        "# @title Extract Clinical Data into Workspace \U0001f513\n",
+        "import zipfile, shutil\n",
+        "from pathlib import Path\n",
+        "\n",
+        "WORKSPACE = Path('/content/workspace')\n",
+        "data_zip  = Path('/content/clinical_data.zip')\n",
+        "data_dest = WORKSPACE / 'clinical_data'\n",
+        "\n",
+        "if not data_zip.exists():\n",
+        "    print('\u274c clinical_data.zip not found. Run Option A or B first.')\n",
+        "else:\n",
+        "    if data_dest.exists():\n",
+        "        shutil.rmtree(data_dest)\n",
+        "    mb = data_zip.stat().st_size / 1024 / 1024\n",
+        "    print(f'\U0001f4e6 Extracting ({mb:.1f} MB)...')\n",
+        "    with zipfile.ZipFile(data_zip, 'r') as zf:\n",
+        "        members = zf.namelist()\n",
+        "        roots = set(m.split('/')[0] for m in members if m.split('/')[0])\n",
+        "        if len(roots) == 1 and 'clinical_data' in roots:\n",
+        "            zf.extractall(WORKSPACE)\n",
+        "        else:\n",
+        "            zf.extractall(data_dest)\n",
+        "    # Verify\n",
+        "    ann_file = data_dest / 'annotations' / 'annotations.json'\n",
+        "    img_dir  = data_dest / 'training_data' / 'images'\n",
+        "    if ann_file.exists() and img_dir.exists():\n",
+        "        n = len(list(img_dir.glob('*.jpg'))) + len(list(img_dir.glob('*.png')))\n",
+        "        print(f'\u2705 Clinical data ready! {n} images found.')\n",
+        "    else:\n",
+        "        print('\u274c Extraction issue. Check zip structure.')\n",
+    ], metadata={"id": "extract-data"}),
+
+    cell("markdown", [
+        "## 4. Install Dependencies \U0001f6e0\ufe0f\n",
+    ], metadata={"id": "section-deps"}),
+
+    cell("code", [
+        "# @title Install Core Libraries \U0001f680\n",
+        "import os, sys\n",
+        "os.chdir('/content/workspace')\n",
+        "sys.path.insert(0, '/content/workspace')\n",
+        "\n",
+        "!pip install -q segmentation-models-pytorch albumentations==1.4.3 onnxruntime-gpu timm onnxscript\n",
+        "\n",
+        "import torch\n",
+        "print(f'\u2705 torch {torch.__version__} (CUDA: {torch.cuda.is_available()})')\n",
+        "from pupil_tracking.ml.trainer import Trainer\n",
+        "print('\u2705 All imports OK!')\n",
+    ], metadata={"id": "install-deps"}),
+
+    cell("markdown", [
+        "## 5. Verify Annotations \u2705\n",
+        "\n",
+        "**Run this before training!** You should see `with_pupil: 166` (not 0).\n",
+    ], metadata={"id": "section-verify"}),
+
+    cell("code", [
+        "# @title Verify Annotation Parsing \U0001f4ca\n",
+        "import os, sys\n",
+        "os.chdir('/content/workspace')\n",
+        "sys.path.insert(0, '/content/workspace')\n",
+        "\n",
+        "from pupil_tracking.ml.dataset import load_annotations, get_annotation_stats\n",
+        "ids, anns = load_annotations('clinical_data/annotations/annotations.json')\n",
+        "stats = get_annotation_stats(anns)\n",
+        "\n",
+        "print(f'Total: {stats[\"total_images\"]}, with pupil: {stats[\"with_pupil\"]}, with limbus: {stats[\"with_limbus\"]}')\n",
+        "if stats['with_pupil'] > 100:\n",
+        "    print('\u2705 Annotations look correct! Ready to train.')\n",
+        "else:\n",
+        "    print('\u274c Re-run step 2 (git pull), then Runtime -> Restart session, then re-run from step 4.')\n",
+    ], metadata={"id": "verify-annotations"}),
+
+    cell("markdown", [
+        "## 6. Run Training \U0001f3cb\ufe0f\n",
+        "\n",
+        "- `--copies-per-image 10` = ~30-40 sec/epoch on T4 (vs ~6 min with default 50)\n",
+        "- 300 epochs \u2248 **2-3 hours** total\n",
+        "- After epoch 1 you should see `val_iou > 0.3`\n",
+    ], metadata={"id": "section-train"}),
+
+    # NOTE: single-line command to avoid bash line-continuation issues in notebooks
+    cell("code", [
+        "# @title Start GPU-Accelerated Training \U0001f680\n",
+        "import os\n",
+        "os.chdir('/content/workspace')\n",
+        "\n",
+        "!python scripts/train_model.py --epochs 300 --batch-size 16 --lr 0.0005 --num-classes 3 --copies-per-image 10 --annotation-path clinical_data/annotations/annotations.json --image-dir clinical_data/training_data/images --mask-dir clinical_data/training_data/masks --save-dir models --device cuda\n",
+    ], metadata={"id": "run-train"}),
+
+    cell("markdown", [
+        "## 7. Export & Download \U0001f4e4\n",
+    ], metadata={"id": "section-export"}),
+
+    cell("code", [
+        "# @title Export to ONNX \U0001f31f\n",
+        "import os\n",
+        "from pathlib import Path\n",
+        "os.chdir('/content/workspace')\n",
+        "\n",
+        "MODEL = '/content/workspace/models/best_model.pth'\n",
+        "ONNX  = '/content/workspace/models/onnx/segmentation.onnx'\n",
+        "\n",
+        "if not Path(MODEL).exists():\n",
+        "    print('\u274c Model not found. Complete training first.')\n",
+        "else:\n",
+        "    Path(ONNX).parent.mkdir(parents=True, exist_ok=True)\n",
+        "    !python scripts/export_onnx.py --model \"{MODEL}\" --output \"{ONNX}\"\n",
+        "    if Path(ONNX).exists():\n",
+        "        mb = Path(ONNX).stat().st_size / 1024 / 1024\n",
+        "        print(f'\u2705 ONNX saved: {ONNX} ({mb:.1f} MB)')\n",
+    ], metadata={"id": "run-export"}),
+
+    cell("code", [
+        "# @title Save to Google Drive \U0001f4be\n",
+        "import shutil\n",
+        "from pathlib import Path\n",
+        "\n",
+        "DRIVE_DIR  = Path('/content/drive/MyDrive/pupil_limbus_models')\n",
+        "MODELS_DIR = Path('/content/workspace/models')\n",
+        "\n",
+        "if not Path('/content/drive').exists():\n",
+        "    print('Drive not mounted. Run Option A first.')\n",
+        "elif not MODELS_DIR.exists():\n",
+        "    print('\u274c No models directory.')\n",
+        "else:\n",
+        "    DRIVE_DIR.mkdir(parents=True, exist_ok=True)\n",
+        "    copied = 0\n",
+        "    for f in MODELS_DIR.rglob('*'):\n",
+        "        if f.is_file() and f.suffix in ('.pth', '.onnx'):\n",
+        "            dest = DRIVE_DIR / f.relative_to(MODELS_DIR)\n",
+        "            dest.parent.mkdir(parents=True, exist_ok=True)\n",
+        "            shutil.copy2(f, dest)\n",
+        "            mb = f.stat().st_size / 1024 / 1024\n",
+        "            print(f'   \u2705 {f.name} ({mb:.1f} MB)')\n",
+        "            copied += 1\n",
+        "    print(f'\u2705 {copied} file(s) saved to Drive.')\n",
+    ], metadata={"id": "save-to-drive"}),
+
+    cell("code", [
+        "# @title Direct Download ZIP \U0001f4be (Alternative)\n",
+        "import shutil\n",
+        "from google.colab import files\n",
+        "from pathlib import Path\n",
+        "\n",
+        "m = Path('/content/workspace/models')\n",
+        "a = '/content/trained_models_colab'\n",
+        "if not m.exists():\n",
+        "    print('\u274c No models.')\n",
+        "else:\n",
+        "    shutil.make_archive(a, 'zip', str(m))\n",
+        "    mb = Path(f'{a}.zip').stat().st_size / 1024 / 1024\n",
+        "    print(f'\u2705 {a}.zip ({mb:.1f} MB)')\n",
+        "    try:\n",
+        "        files.download(f'{a}.zip')\n",
+        "    except Exception as e:\n",
+        "        print(f'Download from sidebar: {a}.zip')\n",
+    ], metadata={"id": "download-direct"}),
+]
+
+nb = {
+    "cells": cells,
+    "metadata": {
+        "colab": {"provenance": [], "toc_visible": True},
+        "kernelspec": {
+            "display_name": "Python 3 (ipykernel)",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {"name": "python", "version": "3.10.0"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 0,
+}
+
+NB_PATH.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
+print(f"Written {NB_PATH} ({NB_PATH.stat().st_size} bytes)")

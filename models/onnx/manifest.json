@@ -1,0 +1,16 @@
+{
+  "format_version": "1.0",
+  "converter": "convert_to_onnx.py",
+  "models": {
+    "segmentation.onnx": {
+      "size_bytes": 97749431,
+      "size_mb": 93.22,
+      "sha256": "2681368772f394bdb35d7fde0ff2bfab6f0758fff288c4d1470309cbf3b4f8c3"
+    },
+    "segmentation_quantized.onnx": {
+      "size_bytes": 24596664,
+      "size_mb": 23.46,
+      "sha256": "59c92936d22829babf5c31825a7c20e5ad9e5058183ada43f9075cdb7c308480"
+    }
+  }
+}
