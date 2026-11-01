@@ -82,3 +82,7 @@ csharp/**/publish/
 # Local audit and terminal artifacts
 /tatus --short
 /pytest_summary.txt
+
+# Private Pentacam annotation records
+**/.pentacam_annotations/
+
