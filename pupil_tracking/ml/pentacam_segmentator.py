@@ -57,6 +57,11 @@ class PentacamSegmentator:
         # Class balancing factors (pupil and limbus are small relative to full image)
         self.pupil_weight = 2.0  # Weight for pupil class
         self.limbus_weight = 1.5  # Weight for limbus class
+        
+        # Checkpoint auditability
+        self._last_checkpoint_path: Optional[str] = None
+        self._last_checkpoint_sha256: Optional[str] = None
+        self._last_load_time: Optional[float] = None
     
     def initialize(self) -> None:
         """Initialize the model architecture. weights loaded separately."""
@@ -367,26 +372,73 @@ class PentacamSegmentator:
         """Load model weights from disk.
         
         Loads the full state dict (encoder + segmentation heads) into the
-        full model.  Uses strict=False to tolerate minor key mismatches
-        from architecture changes, but raises a clear exception if the
-        checkpoint appears completely incompatible.
+        full model using strict matching.  Verifies all expected keys and
+        tensor shapes are compatible.  Raises a clear exception if the
+        checkpoint is missing keys, has unexpected keys, or has shape
+        mismatches.  Only marks the model as loaded after complete
+        verification succeeds.
+        
+        Records the checkpoint path and SHA256 hash for auditability.
         """
         if self.model is not None and self.initialized:
             try:
+                import hashlib
+                import time
+                
+                # Record checkpoint path and SHA256 for auditability
+                self._last_checkpoint_path = path
+                with open(path, 'rb') as f:
+                    self._last_checkpoint_sha256 = hashlib.sha256(f.read()).hexdigest()
+                print(f"Checkpoint SHA256: {self._last_checkpoint_sha256[:16]}...")
+                
+                # Load state dict
                 state_dict = torch.load(path, map_location=self.config.device)
                 
-                # Load into the full model (encoder + segmentation heads)
-                # strict=False allows for minor key mismatches from architecture evolution
-                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                # Verify expected keys exist before loading
+                expected_keys = set(self.model.state_dict().keys())
+                loaded_keys = set(state_dict.keys())
+                
+                missing_in_checkpoint = expected_keys - loaded_keys
+                unexpected_in_checkpoint = loaded_keys - expected_keys
+                
+                if missing_in_checkpoint:
+                    raise ValueError(
+                        f"Checkpoint missing {len(missing_in_checkpoint)} "
+                        f"expected keys: {sorted(missing_in_checkpoint)[:5]}..."
+                    )
+                if unexpected_in_checkpoint:
+                    raise ValueError(
+                        f"Checkpoint has {len(unexpected_in_checkpoint)} "
+                        f"unexpected keys: {sorted(unexpected_in_checkpoint)[:5]}..."
+                    )
+                
+                # Load with strict=True to verify tensor shape compatibility
+                missing_keys, unexpected_keys = self.model.load_state_dict(
+                    state_dict, strict=True)
                 
                 if missing_keys:
-                    print(f"  Warning: {len(missing_keys)} missing keys when loading weights")
+                    raise ValueError(
+                        f"Load failed: {len(missing_keys)} keys missing after "
+                        f"strict load"
+                    )
                 if unexpected_keys:
-                    print(f"  Warning: {len(unexpected_keys)} unexpected keys when loading weights")
+                    raise ValueError(
+                        f"Load failed: {len(unexpected_keys)} unexpected keys after "
+                        f"strict load"
+                    )
                 
-                print(f"Model weights loaded from {path}")
+                print(f"Model weights loaded from {path} "
+                      f"(SHA256: {self._last_checkpoint_sha256[:16]}...)")
+                
+                # Record inference timing
+                self._last_load_time = time.time()
+                
             except Exception as e:
                 print(f"Failed to load weights: {e}")
+                # Clear any partial state
+                self._last_checkpoint_path = None
+                self._last_checkpoint_sha256 = None
+                raise
                 raise
 
 

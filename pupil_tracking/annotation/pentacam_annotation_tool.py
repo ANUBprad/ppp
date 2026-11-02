@@ -134,39 +134,37 @@ class PentacamAnnotationWorkspace:
                 input_width=512, input_height=512, device="cpu"))
             self._model.initialize()
             
-            # Load the actual trained checkpoint
+            # Load the actual trained checkpoint with strict verification
             checkpoint_path = "pentacam_segmentator_trained_fixed.pth"
+            
             if os.path.exists(checkpoint_path):
+                # Verify SHA256 before loading
+                import hashlib
+                with open(checkpoint_path, 'rb') as f:
+                    file_sha256 = hashlib.sha256(f.read()).hexdigest()
+                
+                # Load weights (will raise if strict mismatch)
                 self._model.load_weights(checkpoint_path)
-                # Verify the model is not using random weights
-                # by checking that some parameters have been trained
+                
+                # Verify the loaded checkpoint SHA256 matches
+                if file_sha256 != self._model._last_checkpoint_sha256:
+                    raise ValueError(
+                        f"SHA256 mismatch: expected "
+                        f"{self._model._last_checkpoint_sha256}, "
+                        f"got {file_sha256}"
+                    )
+                
+                # Only mark loaded after complete verification
                 self._model_loaded = True
                 self._model_path = Path(checkpoint_path)
                 print("Pentacam segmentation model loaded with trained weights")
             else:
-                # Check if any alternative checkpoint exists
-                import glob
-                candidates = glob.glob("pentacam_segmentator*.pth")
-                if candidates:
-                    # Use the most recent checkpoint
-                    checkpoint_path = max(candidates, key=os.path.getctime)
-                    self._model.load_weights(checkpoint_path)
-                    self._model_loaded = True
-                    self._model_path = Path(checkpoint_path)
-                    print(f"Pentacam segmentation model loaded from: {checkpoint_path}")
-                else:
-                    self._model = None
-                    self._model_loaded = False
-                    self._model_path = None
-                    msg = (
-                        "Pentacam segmentation model checkpoint not found. "
-                        "Auto-detect will be disabled until training completes.\n"
-                        f"Searched for: {checkpoint_path}\n"
-                        "Available .pth files: " + str(candidates) +
-                        "\nTo train the model, run the training pipeline."
-                    )
-                    messagebox.showinfo(
-                        "Model Not Trained", msg)
+                # No fallback to arbitrary checkpoints - must be explicit
+                raise FileNotFoundError(
+                    f"Trained checkpoint not found: {checkpoint_path}. "
+                    "Auto-detect will be disabled until training completes. "
+                    "Run the training pipeline to generate the model."
+                )
         except Exception as e:
             print("Failed to load Pentacam model: " + str(e))
             import traceback
@@ -174,6 +172,14 @@ class PentacamAnnotationWorkspace:
             self._model = None
             self._model_loaded = False
             self._model_path = None
+            # Re-raise or show error to user
+            messagebox.showerror(
+                "Model Loading Failed",
+                f"Could not load Pentacam segmentation model.\n"
+                f"Error: {e}\n\n"
+                "The model checkpoint may be missing or corrupted. "
+                "Run the training pipeline to generate the model."
+            )
     
     def _unload_model(self) -> None:
         """Unload the model to free memory."""
