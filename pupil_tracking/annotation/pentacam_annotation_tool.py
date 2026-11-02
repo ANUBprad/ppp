@@ -121,6 +121,9 @@ class PentacamAnnotationWorkspace:
         self._model_confidence_pupil = 0.0
         self._model_confidence_limbus = 0.0
 
+        # Initialize UI state after all application state is set up
+        self._initialize_ui_state()
+
     # ------------------------------ Detection ---------------------------------
     
     def _load_model(self) -> None:
@@ -313,6 +316,9 @@ class PentacamAnnotationWorkspace:
         self._show_limbus_prediction = False
         self._model_confidence_pupil = 0.0
         self._model_confidence_limbus = 0.0
+
+        # Initialize UI state after all application state is set up
+        self._initialize_ui_state()
         self._status_var.set("Predictions cleared")
         self._on_metadata_changed()
     
@@ -376,9 +382,15 @@ class PentacamAnnotationWorkspace:
         
         return disp
     
-    # ------------------------------ UI ---------------------------------
-    
-    def _build_ui(self) -> None:
+    def _initialize_ui_state(self) -> None:
+        """Initialize Tkinter variables and build the UI.
+
+        Must be called once after all application state is set up in __init__.
+        Initializes Tkinter variables, builds widgets, attaches traces,
+        and registers window close handler.
+        """
+        # Initialize ALL Tkinter variables required by the UI
+        self._eye_var = tk.StringVar(value="OD")
         self._image_type_var = tk.StringVar(value=PentacamImageType.UNKNOWN.value)
         self._quality_var = tk.StringVar(value=PentacamQuality.NO_DETECTION.value)
         self._mode_var = tk.StringVar(value="pupil")
@@ -389,7 +401,10 @@ class PentacamAnnotationWorkspace:
         self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
         self._counter_var = tk.StringVar(value="0 / 0 images")
 
+        # Build the actual UI widgets
         self._build_ui()
+
+        # Attach metadata variable traces
         for variable in (
             self._eye_var,
             self._image_type_var,
@@ -399,10 +414,12 @@ class PentacamAnnotationWorkspace:
         ):
             variable.trace_add("write", self._on_metadata_changed)
 
+        # Register window close handler
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Load dataset directory if provided
         if self.dataset_dir is not None:
             self._load_dataset_dir(self.dataset_dir)
-
     # ------------------------------ UI ---------------------------------
     def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
