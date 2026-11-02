@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "pupil_tracking/annotation/**"
+      - "launch_gui.py"
       - "pupil_tracking/tests/test_pentacam_workspace_core.py"
       - ".github/workflows/pentacam-annotation-tests.yml"
   pull_request:
     paths:
-      - "pupil_tracking/annotation/**"
+      - "launch_gui.py"
       - "pupil_tracking/tests/test_pentacam_workspace_core.py"
       - ".github/workflows/pentacam-annotation-tests.yml"
 
@@ -28,7 +28,7 @@ jobs:
           cache: pip
       - name: Install focused test dependencies
         run: python -m pip install --upgrade pip pytest numpy opencv-python-headless pillow
-      - name: Compile annotation modules
-        run: python -m compileall -q pupil_tracking/annotation
+      - name: Compile main launcher and embedded annotation workspace
+        run: python -m py_compile launch_gui.py
       - name: Run annotation core tests
         run: python -m pytest pupil_tracking/tests/test_pentacam_workspace_core.py -q
