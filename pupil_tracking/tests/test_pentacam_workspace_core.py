@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from launch_gui import (
+from pupil_tracking.annotation.workspace_core import (
     AnnotationValidationError,
     build_segmentation_mask,
     denormalize_roi_box,
