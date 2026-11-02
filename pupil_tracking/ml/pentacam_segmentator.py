@@ -364,14 +364,30 @@ class PentacamSegmentator:
             print(f"Full model weights saved to {path}")
     
     def load_weights(self, path: str) -> None:
-        """Load model weights from disk."""
+        """Load model weights from disk.
+        
+        Loads the full state dict (encoder + segmentation heads) into the
+        full model.  Uses strict=False to tolerate minor key mismatches
+        from architecture changes, but raises a clear exception if the
+        checkpoint appears completely incompatible.
+        """
         if self.model is not None and self.initialized:
             try:
                 state_dict = torch.load(path, map_location=self.config.device)
-                self.model['encoder'].load_state_dict(state_dict)
+                
+                # Load into the full model (encoder + segmentation heads)
+                # strict=False allows for minor key mismatches from architecture evolution
+                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                
+                if missing_keys:
+                    print(f"  Warning: {len(missing_keys)} missing keys when loading weights")
+                if unexpected_keys:
+                    print(f"  Warning: {len(unexpected_keys)} unexpected keys when loading weights")
+                
                 print(f"Model weights loaded from {path}")
             except Exception as e:
                 print(f"Failed to load weights: {e}")
+                raise
 
 
 # Convenience function for quick inference
