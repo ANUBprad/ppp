@@ -14,6 +14,8 @@ USAGE EXAMPLES:
   python launch_gui.py video -i vid.mp4 --stride 3    # Skip frames
   python launch_gui.py video -i vid.mp4 -o out.mp4    # Save output
   python launch_gui.py camera                         # Live webcam
+  python launch_gui.py annotate                        # Open Pentacam annotation workspace
+  python launch_gui.py annotate --dataset-dir "path\to\pentacam"
 
 RING DETECTION & ADAPTIVE PIPELINE (NEW):
 -----------------------------------------------------------------------
@@ -1552,6 +1554,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "    python launch_gui.py camera --grayscale force\n"
             "    python launch_gui.py camera  # press [G] to toggle\n"
             "\n"
+            "  Pentacam manual annotation:\n"
+            "    python launch_gui.py annotate\n"
+            "    python launch_gui.py annotate --dataset-dir ./pentacam_images\n"
+            "    python launch_gui.py annotate --dataset-dir ./pentacam_images --annotation-dir ./.pentacam_annotations\n"
+            "\n"
             "---------------------------------------------------------\n"
         ),
     )
@@ -1560,8 +1567,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "mode",
         nargs="?",
         default="gui",
-        choices=["gui", "image", "video", "camera"],
-        help="Processing mode: gui / image / video / camera",
+        choices=["gui", "image", "video", "camera", "annotate"],
+        help="Processing mode: gui / image / video / camera / annotate",
+    )
+
+    annotation_group = parser.add_argument_group("PENTACAM ANNOTATION")
+    annotation_group.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Pentacam image directory (optional; can also be selected in the workspace)",
+    )
+    annotation_group.add_argument(
+        "--annotation-dir",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Private annotation storage directory (default: ./.pentacam_annotations)",
     )
 
     io_group = parser.add_argument_group("INPUT / OUTPUT")
@@ -1805,6 +1828,28 @@ def _run_startup_self_check(args: argparse.Namespace, cfg: Any) -> int:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Keep Pentacam annotation isolated from detector startup and settings.
+    # The annotation workspace is launched lazily so existing GUI/image/video/
+    # camera entry points retain their original initialization path.
+    if args.mode == "annotate":
+        from pupil_tracking.annotation.pentacam_annotation_tool import (
+            launch_pentacam_workspace,
+        )
+
+        dataset_dir = (
+            Path(args.dataset_dir).expanduser()
+            if args.dataset_dir else None
+        )
+        annotation_dir = (
+            Path(args.annotation_dir).expanduser()
+            if args.annotation_dir else None
+        )
+        launch_pentacam_workspace(
+            dataset_dir=dataset_dir,
+            annotation_dir=annotation_dir,
+        )
+        return
 
     print(_BANNER)
     print(
