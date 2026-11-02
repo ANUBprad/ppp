@@ -390,36 +390,43 @@ class PentacamAnnotationWorkspace:
         and registers window close handler.
         """
         # Initialize ALL Tkinter variables required by the UI
-        self._eye_var = tk.StringVar(value="OD")
-        self._image_type_var = tk.StringVar(value=PentacamImageType.UNKNOWN.value)
-        self._quality_var = tk.StringVar(value=PentacamQuality.NO_DETECTION.value)
-        self._mode_var = tk.StringVar(value="pupil")
-        self._orientation_var = tk.StringVar(value="0")
-        self._annotator_var = tk.StringVar(value="")
-        self._failure_reason_var = tk.StringVar(value="")
-        self._roi_preview_var = tk.BooleanVar(value=False)
-        self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
-        self._counter_var = tk.StringVar(value="0 / 0 images")
+        import traceback
+        try:
+            # Initialize ALL Tkinter variables required by the UI
+            self._image_type_var = tk.StringVar(value=PentacamImageType.UNKNOWN.value)
+            self._eye_var = tk.StringVar(value="OD")
+            self._quality_var = tk.StringVar(value=PentacamQuality.NO_DETECTION.value)
+            self._mode_var = tk.StringVar(value="pupil")
+            self._orientation_var = tk.StringVar(value="0")
+            self._annotator_var = tk.StringVar(value="")
+            self._failure_reason_var = tk.StringVar(value="")
+            self._roi_preview_var = tk.BooleanVar(value=False)
+            self._status_var = tk.StringVar(value="Choose a dataset directory to begin")
+            self._counter_var = tk.StringVar(value="0 / 0 images")
 
-        # Build the actual UI widgets
-        self._build_ui()
+            # Build the actual UI widgets
+            self._build_ui()
 
-        # Attach metadata variable traces
-        for variable in (
+            # Attach metadata variable traces
+            for variable in (
             self._eye_var,
             self._image_type_var,
             self._quality_var,
             self._annotator_var,
             self._failure_reason_var,
-        ):
-            variable.trace_add("write", self._on_metadata_changed)
+            ):
+                variable.trace_add("write", self._on_metadata_changed)
 
-        # Register window close handler
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+            # Register window close handler
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Load dataset directory if provided
-        if self.dataset_dir is not None:
-            self._load_dataset_dir(self.dataset_dir)
+            # Load dataset directory if provided
+            if self.dataset_dir is not None:
+                self._load_dataset_dir(self.dataset_dir)
+        except Exception as e:
+            print("GUI initialization error:")
+            traceback.print_exc()
+            raise
     # ------------------------------ UI ---------------------------------
     def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
