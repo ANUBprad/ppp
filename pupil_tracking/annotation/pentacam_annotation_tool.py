@@ -20,6 +20,8 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from pupil_tracking.pentacam.types import PentacamImageType, PentacamQuality
+
+from pupil_tracking.ml.pentacam_segmentator import PentacamSegmentator, PentacamSegmentationConfig
 from .workspace_core import (
     AnnotationValidationError,
     build_segmentation_mask,
@@ -110,7 +112,230 @@ class PentacamAnnotationWorkspace:
         self._autosave_job: Optional[str] = None
         self._loading_metadata = False
 
-        self._eye_var = tk.StringVar(value="OD")
+        self._model: Optional[PentacamSegmentator] = None
+        self._model_loaded = False
+        self._model_path: Optional[Path] = None
+        self._detection_results: Optional[dict] = None
+        self._show_pupil_prediction = False
+        self._show_limbus_prediction = False
+        self._model_confidence_pupil = 0.0
+        self._model_confidence_limbus = 0.0
+
+    # ------------------------------ Detection ---------------------------------
+    
+    def _load_model(self) -> None:
+        """Load the Pentacam segmentation model lazily."""
+        if self._model_loaded:
+            return
+        
+        try:
+            self._model = PentacamSegmentator(PentacamSegmentationConfig(input_width=512, input_height=512, device="cpu"))
+            self._model_loaded = True
+            self._model_path = Path("pentacam_segmentator_trained.pth") if Path("pentacam_segmentator_trained.pth").exists() else None
+            print("Pentacam segmentation model loaded")
+        except Exception as e:
+            print("Failed to load Pentacam model: " + str(e))
+            self._model = None
+            self._model_loaded = False
+    
+    def _unload_model(self) -> None:
+        """Unload the model to free memory."""
+        self._model = None
+        self._model_loaded = False
+        self._model_path = None
+        import gc
+        gc.collect()
+    
+    def _get_current_image(self) -> Optional[np.ndarray]:
+        """Get the current original image for inference."""
+        if self.original_image is not None:
+            return self.original_image.copy()
+        return None
+    
+    def run_detection(self) -> None:
+        """Run Pentacam segmentation inference on the current image."""
+        import time
+        import numpy as np
+        
+        # Load model lazily
+        self._load_model()
+        
+        if self._model is None or self.original_image is None:
+            messagebox.showinfo("Model Not Available", 
+                "Pentacam segmentation model could not be loaded. "
+                "The model weights require training on Pentacam data.")
+            return
+        
+        start_time = time.time()
+        
+        # Get the current image
+        image = self._get_current_image()
+        if image is None:
+            messagebox.showinfo("No Image", "No image loaded for inference.")
+            return
+        
+        # Run inference
+        with torch.no_grad():
+            result = self._model.segment_and_detect(image)
+        
+        # Store results
+        self._detection_results = result
+        inference_time = time.time() - start_time
+        
+        # Store confidence scores
+        self._model_confidence_pupil = result.get('pupil_confidence', 0.0)
+        self._model_confidence_limbus = result.get('limbus_confidence', 0.0)
+        
+        # Update UI state
+        self._show_pupil_prediction = True
+        self._show_limbus_prediction = True
+        
+        # Update status
+        self._status_var.set(
+            f"Auto-detected: pupil confidence={self._model_confidence_pupil:.3f}, "
+            f"limbus confidence={self._model_confidence_limbus:.3f} "
+            f"(inference: {inference_time*1000:.1f}ms)"
+        )
+        
+        # Refresh canvas to show overlays
+        self._refresh_canvas()
+        self._on_metadata_changed()
+    
+    def toggle_pupil_prediction(self) -> None:
+        """Toggle visibility of pupil prediction overlay."""
+        self._show_pupil_prediction = not self._show_pupil_prediction
+        self._on_metadata_changed()
+    
+    def toggle_limbus_prediction(self) -> None:
+        """Toggle visibility of limbus prediction overlay."""
+        self._show_limbus_prediction = not self._show_limbus_prediction
+        self._on_metadata_changed()
+    
+    def accept_pupil_prediction(self) -> None:
+        """Accept the pupil prediction into the annotation workflow."""
+        if self._detection_results is None:
+            return
+        
+        pupil_ellipse = self._detection_results.get('pupil_ellipse', {})
+        if not pupil_ellipse.get('valid', False):
+            messagebox.showinfo("Invalid Prediction", "Pupil ellipse fitting failed.")
+            return
+        
+        # Convert prediction to annotation coordinates
+        # The prediction is already in original-image pixel coordinates
+        self._ellipses["pupil"] = pupil_ellipse
+        
+        # Store as a manual annotation point
+        self._status_var.set("Pupil prediction accepted and added to annotation")
+        
+        # Reset prediction state
+        self._detection_results = None
+        self._show_pupil_prediction = False
+        self._model_confidence_pupil = 0.0
+        
+        self._on_metadata_changed()
+    
+    def accept_limbus_prediction(self) -> None:
+        """Accept the limbus prediction into the annotation workflow."""
+        if self._detection_results is None:
+            return
+        
+        limbus_ellipse = self._detection_results.get('limbus_ellipse', {})
+        if not limbus_ellipse.get('valid', False):
+            messagebox.showinfo("Invalid Prediction", "Limbus ellipse fitting failed.")
+            return
+        
+        # Accept the limbus prediction
+        self._ellipses["limbus"] = limbus_ellipse
+        
+        # Store as a manual annotation point
+        self._status_var.set("Limbus prediction accepted and added to annotation")
+        
+        # Reset prediction state
+        self._detection_results = None
+        self._show_limbus_prediction = False
+        self._model_confidence_limbus = 0.0
+        
+        self._on_metadata_changed()
+    
+    def accept_both_predictions(self) -> None:
+        """Accept both pupil and limbus predictions."""
+        self.accept_pupil_prediction()
+        self.accept_limbus_prediction()
+    
+    def reject_predictions(self) -> None:
+        """Reject/clear all predictions."""
+        self._detection_results = None
+        self._show_pupil_prediction = False
+        self._show_limbus_prediction = False
+        self._model_confidence_pupil = 0.0
+        self._model_confidence_limbus = 0.0
+        self._status_var.set("Predictions cleared")
+        self._on_metadata_changed()
+    
+    def _render_detection_overlays(self, overlay: np.ndarray) -> np.ndarray:
+        """Render pupil and limbus prediction overlays on the given image."""
+        if self._detection_results is None or self.original_image is None:
+            return overlay
+        
+        disp = overlay.copy()
+        colors = {
+            "pupil": (0, 220, 80),  # GREEN #00D24A
+            "limbus": (255, 150, 0),  # BLUE #168CFF (approximate)
+        }
+        
+        # Draw pupil ellipse
+        if self._show_pupil_prediction and self._detection_results.get('pupil_ellipse', {}).get('valid', False):
+            pupil_ellipse = self._detection_results['pupil_ellipse']
+            center = pupil_ellipse['center']
+            axes = pupil_ellipse['axes']
+            angle = pupil_ellipse['angle']
+            
+            # Draw ellipse
+            cv2.ellipse(disp, 
+                        (int(center[0]), int(center[1])), 
+                        (int(axes[0]), int(axes[1])), 
+                        angle, 0, 360, colors["pupil"], 2)
+            
+            # Draw center point
+            cv2.circle(disp, (int(center[0]), int(center[1])), 4, colors["pupil"], -1)
+        
+        # Draw limbus ellipse
+        if self._show_limbus_prediction and self._detection_results.get('limbus_ellipse', {}).get('valid', False):
+            limbus_ellipse = self._detection_results['limbus_ellipse']
+            center = limbus_ellipse['center']
+            axes = limbus_ellipse['axes']
+            angle = limbus_ellipse['angle']
+            
+            # Draw ellipse
+            cv2.ellipse(disp, 
+                        (int(center[0]), int(center[1])), 
+                        (int(axes[0]), int(axes[1])), 
+                        angle, 0, 360, colors["limbus"], 2)
+            
+            # Draw center point
+            cv2.circle(disp, (int(center[0]), int(center[1])), 4, colors["limbus"], -1)
+        
+        # Draw confidence text
+        if self._show_pupil_prediction:
+            cv2.putText(disp, f"Pupil: {self._model_confidence_pupil:.3f}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors["pupil"], 2)
+        
+        if self._show_limbus_prediction:
+            cv2.putText(disp, f"Limbus: {self._model_confidence_limbus:.3f}", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors["limbus"], 2)
+        
+        # Add disclaimer text
+        cv2.putText(disp, "Model: uncalibrated (requires Pentacam training)", 
+                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(disp, "Press Accept to integrate into annotation", 
+                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return disp
+    
+    # ------------------------------ UI ---------------------------------
+    
+    def _build_ui(self) -> None:
         self._image_type_var = tk.StringVar(value=PentacamImageType.UNKNOWN.value)
         self._quality_var = tk.StringVar(value=PentacamQuality.NO_DETECTION.value)
         self._mode_var = tk.StringVar(value="pupil")
@@ -290,6 +515,25 @@ class PentacamAnnotationWorkspace:
         ttk.Button(exports, text="Export overlay PNG…", command=self._export_overlay).pack(fill="x", padx=5, pady=2)
         ttk.Button(exports, text="Export segmentation mask…", command=self._export_mask).pack(fill="x", padx=5, pady=2)
 
+        # Auto-detect boundaries frame
+        auto_frame = ttk.LabelFrame(controls, text="Auto-detect")
+        auto_frame.pack(fill="x", pady=(0, 8))
+        ttk.Button(auto_frame, text="Auto-detect boundaries", 
+                   command=self.run_detection).pack(fill="x", padx=5, pady=2)
+        ttk.Checkbutton(auto_frame, text="Show pupil prediction", 
+                       variable=self._show_pupil_prediction,
+                       command=self.toggle_pupil_prediction).pack(anchor="w", padx=5, pady=2)
+        ttk.Checkbutton(auto_frame, text="Show limbus prediction", 
+                       variable=self._show_limbus_prediction,
+                       command=self.toggle_limbus_prediction).pack(anchor="w", padx=5, pady=2)
+        ttk.Button(auto_frame, text="Accept pupil", 
+                   command=self.accept_pupil_prediction).pack(fill="x", padx=5, pady=2)
+        ttk.Button(auto_frame, text="Accept limbus", 
+                   command=self.accept_limbus_prediction).pack(fill="x", padx=5, pady=2)
+        ttk.Button(auto_frame, text="Accept both", 
+                   command=self.accept_both_predictions).pack(fill="x", padx=5, pady=2)
+        ttk.Button(auto_frame, text="Reject predictions", 
+                   command=self.reject_predictions).pack(fill="x", padx=5, pady=2)
         ttk.Label(
             controls,
             text="Left click: add point  |  Right click: undo\nMiddle-drag: pan  |  Mouse wheel: zoom\nOriginal images are never modified.",
