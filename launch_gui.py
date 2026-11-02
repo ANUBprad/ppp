@@ -1533,6 +1533,10 @@ def _export_results_csv(results: List[Dict[str, Any]], csv_path: str) -> None:
 # dependencies are loaded only when annotate mode is requested.
 # ==================================================================
 
+SUPPORTED_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({"1.0", "1.1"})
+
+
 class AnnotationValidationError(ValueError):
     """Raised when an annotation cannot safely be stored or exported."""
 
